@@ -1,0 +1,33 @@
+{
+  "name": "multiagency-bot",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Telegram bot for MultiAgency",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "core-demo": "rm -f data/core-demo.sqlite* && BOT_TOKEN=000000:demo DATABASE_PATH=./data/core-demo.sqlite ADMIN_IDS=1 tsx scripts/core-demo.ts",
+    "demo": "rm -f data/demo-loop.sqlite* && BOT_TOKEN=000000:demo-dummy-token DATABASE_PATH=./data/demo-loop.sqlite ADMIN_IDS=1 NEAR_AI_API_KEY= tsx scripts/demo-loop.ts",
+    "queue-demo": "rm -f data/queue-demo.sqlite* && BOT_TOKEN=000000:demo DATABASE_PATH=./data/queue-demo.sqlite ADMIN_IDS=1 tsx scripts/queue-demo.ts",
+    "edge-demo": "rm -f data/edge-demo.sqlite* && BOT_TOKEN=000000:demo DATABASE_PATH=./data/edge-demo.sqlite ADMIN_IDS=1 BOT_USERNAME=DemoBot NEAR_AI_API_KEY= NOTIFY_RATE_PER_SEC=1000 tsx scripts/edge-demo.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
+    "test": "npm run typecheck && npm run build && npm run core-demo && npm run demo && npm run queue-demo && npm run edge-demo"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "dotenv": "^16.4.7",
+    "openai": "^4.104.0",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

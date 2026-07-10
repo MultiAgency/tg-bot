@@ -1,0 +1,65 @@
+import { Markup } from 'telegraf';
+import type { Task } from '../core/models/task.js';
+import type { Application } from '../core/models/application.js';
+import type { Submission } from '../core/models/submission.js';
+import { submissionTruncated } from './format.js';
+import { t } from './i18n.js';
+
+/**
+ * Every builder takes the recipient's locale: labels are user-facing chrome and
+ * route through the catalog like all other chrome (the i18n drop-in-locale
+ * invariant). Command handlers pass localeOf(ctx); notification producers pass
+ * the recipient's stored locale.
+ */
+
+export const applyButton = (task: Task, locale: string) =>
+  Markup.inlineKeyboard([Markup.button.callback(t(locale, 'btn.apply', { id: task.id }), `apply:${task.id}`)]);
+
+/**
+ * Apply button for the public announcement channel: a deep link into the bot's
+ * private chat (?start=t<id> is handled in bot.start), since the pitch wizard
+ * can't run inside a channel. Needs the bot's @username.
+ */
+export const announceApplyButton = (task: Task, botUsername: string, locale: string) =>
+  Markup.inlineKeyboard([
+    Markup.button.url(t(locale, 'btn.apply', { id: task.id }), `https://t.me/${botUsername}?start=t${task.id}`),
+  ]);
+
+export const approveButton = (task: Task, locale: string) =>
+  Markup.inlineKeyboard([
+    Markup.button.callback(t(locale, 'btn.approveOpen', { id: task.id }), `approve:${task.id}`),
+  ]);
+
+/** Assign / decline buttons for one applicant (keyed by application id). */
+export const applicantButtons = (app: Application, locale: string) =>
+  Markup.inlineKeyboard([
+    [
+      Markup.button.callback(t(locale, 'btn.assign'), `assign:${app.id}`),
+      Markup.button.callback(t(locale, 'btn.decline'), `decline:${app.id}`),
+    ],
+  ]);
+
+export const submitButton = (app: Application, locale: string) =>
+  Markup.inlineKeyboard([Markup.button.callback(t(locale, 'btn.submit'), `submit:${app.id}`)]);
+
+export const withdrawButton = (app: Application, locale: string) =>
+  Markup.inlineKeyboard([Markup.button.callback(t(locale, 'btn.withdraw'), `withdraw:${app.id}`)]);
+
+/**
+ * Approve / reject / revise buttons for one submission version. When the card
+ * had to clip the content, a "Full submission" row lets the reviewer read every
+ * character before deciding.
+ */
+export const reviewButtons = (submission: Submission, locale: string) => {
+  const rows = [
+    [
+      Markup.button.callback(t(locale, 'btn.revApprove'), `rev:approve:${submission.id}`),
+      Markup.button.callback(t(locale, 'btn.revReject'), `rev:reject:${submission.id}`),
+      Markup.button.callback(t(locale, 'btn.revRevise'), `rev:revise:${submission.id}`),
+    ],
+  ];
+  if (submissionTruncated(submission)) {
+    rows.push([Markup.button.callback(t(locale, 'btn.full'), `full:${submission.id}`)]);
+  }
+  return Markup.inlineKeyboard(rows);
+};
