@@ -33,7 +33,7 @@ export const reviewNoteScene = new Scenes.WizardScene<BotContext>(
     // Pre-gate what the service must refuse anyway — don't collect a typed-out
     // note for a submission another admin already decided (stale card) or that
     // was erased. (The service re-checks inside the transaction.)
-    const sub = getSubmission(st.submissionId);
+    const sub = await getSubmission(st.submissionId);
     if (!sub) {
       await ctx.reply(t(L, 'full.gone'));
       return ctx.scene.leave();
@@ -61,13 +61,13 @@ export const reviewNoteScene = new Scenes.WizardScene<BotContext>(
     // notify/reply below must surface in bot.catch, not as a false "failed".
     let sub;
     try {
-      sub = reviewSubmission(st.submissionId!, ctx.from!.id, st.decision!, note);
+      sub = await reviewSubmission(st.submissionId!, ctx.from!.id, st.decision!, note);
     } catch (err) {
       await ctx.reply(errorMessage(err, t(L, 'rev.fail')));
       return ctx.scene.leave();
     }
-    const app = getApplication(sub.application_id)!;
-    notifyContributorReview(sub.id, app.contributor_id, getTask(app.task_id), st.decision!, note);
+    const app = (await getApplication(sub.application_id))!;
+    await notifyContributorReview(sub.id, app.contributor_id, await getTask(app.task_id), st.decision!, note);
     await ctx.reply(t(L, 'rev.recorded', { id: sub.id, status: sub.status }));
     return ctx.scene.leave();
   },

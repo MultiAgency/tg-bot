@@ -87,8 +87,12 @@ on application and review cards but never gate any action. A derived reputation
 label (trusted/flagged) is deliberately deferred until real workflow data
 exists to calibrate what the thresholds should mean. Right-to-erasure via
 `/forget`: profile, applications, and submissions deleted; history scrubbed of
-pitches and mentions; task authorship (`created_by`) cleared. Non-admin `/status`
-hides other people's application events.
+pitches and mentions; task authorship (`created_by`) cleared. Erased PII leaves
+the live database immediately; copies in Railway's managed backups age out within
+a bounded retention window (6-day daily snapshots, ~7-day point-in-time
+recovery), so a `/forget` is fully effective across every copy within about a
+week — the erasure guarantee the app no longer snapshots for itself. Non-admin
+`/status` hides other people's application events.
 
 ### Submission & review flow
 
@@ -103,6 +107,24 @@ Draft a task description, suggest a required-output spec, and summarize a
 submission for the reviewer (noting possibly-missing requirements — observations,
 never a verdict). AI never assigns, approves, or rejects.
 The bot is fully functional without an API key.
+
+### Rooms & room-scoped admins
+
+Every group the bot joins is a **room**; whoever added the bot becomes its
+first room admin, and more are added by reply (`/addroomadmin`). Room admins
+manage their rooms' tasks (approve/assign/review/close/unassign, plus the
+matching notifications) without an `ADMIN_IDS` entry. Task creation, `/admin`,
+and `/forget` stay global-admin-only; DM-created tasks belong to no room.
+
+### Signal detection (opt-in per group)
+
+Where a room admin ran `/enablesignals` (announced publicly in the group), the
+bot AI-scores messages and auto-creates **Draft** tasks from promising ones —
+prefilter → per-room hourly budget (`SIGNAL_MAX_PER_HOUR`) → AI score gate
+(`SIGNAL_SCORE_THRESHOLD`). Humans approve every draft; AI never opens a task.
+Privacy: message text is processed then dropped, never stored; the author is
+recorded nowhere (signal rows are room + score + outcome only), preserving the
+/privacy promise that group-only users are never recorded.
 
 ## Out of scope (later phases)
 
@@ -125,10 +147,13 @@ The bot is fully functional without an API key.
 - `src/core/` stays free of Telegram imports — it is the seam for a future API.
 - All mutations go through `src/core/service.ts`, inside transactions, with history.
 - AI output is always advisory: suggestions and notes, never a state transition.
+  (Signal detection creates *Drafts* — the human approval step is the boundary.)
+- Signals store no message text and no author identity — only room, score, and
+  outcome. Widening that is a /privacy change, not a schema tweak.
 - Notifications never carry state — `/open` and `/myapps` are canonical.
-- All durable state lives in the SQLite file; the process is disposable. (The
-  only in-memory state is in-flight wizard sessions — a restart loses wizard
-  progress, never task data.)
+- All durable state lives in PostgreSQL; the process is disposable. (The only
+  in-memory state is in-flight wizard sessions — a restart loses wizard progress,
+  never task data.)
 
 ## Done when
 

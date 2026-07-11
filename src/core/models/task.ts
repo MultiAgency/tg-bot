@@ -1,4 +1,4 @@
-import { db, nowIso } from '../db.js';
+import { one, many, nowIso } from '../db.js';
 import { TaskStatus } from '../workflow.js';
 
 export interface Task {
@@ -11,6 +11,7 @@ export interface Task {
   max_assignees: number;
   status: TaskStatus;
   created_by: number | null;
+  room_chat_id: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -22,51 +23,63 @@ export interface NewTaskInput {
   deadline?: string | null;
   requiredOutput?: string | null;
   maxAssignees?: number;
-  createdBy: number;
+  /** null for signal-drafted tasks: the group author never opted into the bot. */
+  createdBy: number | null;
+  /** The room a signal-drafted task belongs to (room admins may manage it). */
+  roomChatId?: number | null;
 }
 
-const insertStmt = db.prepare(`
-  INSERT INTO tasks (title, description, reward, deadline, required_output, max_assignees, status, created_by, created_at, updated_at)
-  VALUES (@title, @description, @reward, @deadline, @required_output, @max_assignees, @status, @created_by, @now, @now)
-`);
-
-const getStmt = db.prepare('SELECT * FROM tasks WHERE id = ?');
-
-export function createTask(input: NewTaskInput): Task {
-  const info = insertStmt.run({
-    title: input.title,
-    description: input.description,
-    reward: input.reward ?? null,
-    deadline: input.deadline ?? null,
-    required_output: input.requiredOutput ?? null,
-    max_assignees: input.maxAssignees ?? 1,
-    status: TaskStatus.Draft,
-    created_by: input.createdBy,
-    now: nowIso(),
-  });
-  return getTask(Number(info.lastInsertRowid))!;
+export async function createTask(input: NewTaskInput): Promise<Task> {
+  return (await one<Task>(
+    `INSERT INTO tasks (title, description, reward, deadline, required_output, max_assignees, status, created_by, room_chat_id, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+     RETURNING *`,
+    [
+      input.title,
+      input.description,
+      input.reward ?? null,
+      input.deadline ?? null,
+      input.requiredOutput ?? null,
+      input.maxAssignees ?? 1,
+      TaskStatus.Draft,
+      input.createdBy,
+      input.roomChatId ?? null,
+      nowIso(),
+    ],
+  ))!;
 }
 
-export function getTask(id: number): Task | undefined {
-  return getStmt.get(id) as Task | undefined;
+export async function getTask(id: number): Promise<Task | undefined> {
+  return one<Task>('SELECT * FROM tasks WHERE id = $1', [id]);
 }
 
-const byStatusStmt = db.prepare('SELECT * FROM tasks WHERE status = ? ORDER BY created_at ASC, id ASC');
+/** Fetch many tasks by id in one round trip (listing commands avoid N+1). */
+export const listByIds = (ids: number[]): Promise<Task[]> =>
+  many<Task>('SELECT * FROM tasks WHERE id = ANY($1)', [ids]);
 
-function listByStatus(status: TaskStatus): Task[] {
-  return byStatusStmt.all(status) as Task[];
+/**
+ * Fetch a task with a row lock (SELECT … FOR UPDATE). Must be called inside a
+ * transaction: it serializes concurrent slot-consuming writes to the same task
+ * (assignApplication), so two managers can't both read an open slot and oversell.
+ */
+export async function getTaskForUpdate(id: number): Promise<Task | undefined> {
+  return one<Task>('SELECT * FROM tasks WHERE id = $1 FOR UPDATE', [id]);
 }
 
-export const listOpen = () => listByStatus(TaskStatus.Open);
-export const listDrafts = () => listByStatus(TaskStatus.Draft);
+function listByStatus(status: TaskStatus): Promise<Task[]> {
+  return many<Task>('SELECT * FROM tasks WHERE status = $1 ORDER BY created_at ASC, id ASC', [status]);
+}
 
-const countByStatusStmt = db.prepare('SELECT COUNT(*) AS n FROM tasks WHERE status = ?');
+export const listOpen = (): Promise<Task[]> => listByStatus(TaskStatus.Open);
+export const listDrafts = (): Promise<Task[]> => listByStatus(TaskStatus.Draft);
 
-export const countByStatus = (status: TaskStatus): number =>
-  (countByStatusStmt.get(status) as { n: number }).n;
+export async function countByStatus(status: TaskStatus): Promise<number> {
+  return (await one<{ n: number }>('SELECT COUNT(*) AS n FROM tasks WHERE status = $1', [status]))!.n;
+}
 
-const updateStatusStmt = db.prepare('UPDATE tasks SET status = @status, updated_at = @now WHERE id = @id');
-
-export function setStatus(id: number, status: TaskStatus): void {
-  updateStatusStmt.run({ id, status, now: nowIso() });
+export async function setStatus(id: number, status: TaskStatus): Promise<Task> {
+  return (await one<Task>(
+    'UPDATE tasks SET status = $1, updated_at = $2 WHERE id = $3 RETURNING *',
+    [status, nowIso(), id],
+  ))!;
 }

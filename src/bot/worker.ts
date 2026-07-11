@@ -1,17 +1,15 @@
 import { config } from '../config.js';
-import { backupDb } from '../core/db.js';
 import {
   claimDue,
-  enqueue,
   isStillQueued,
   markSent,
   markRetry,
   markFailed,
+  deferChatRowsAfter,
   pruneFinished,
   type NotificationRow,
   type MediaKind,
 } from '../core/models/notification.js';
-import { t, contributorLocale } from './i18n.js';
 
 /**
  * The single global notification worker. It drains the queue one message at a
@@ -33,6 +31,7 @@ export interface Sender {
   sendPhoto(chatId: number | string, file: string, extra?: Record<string, unknown>): Promise<unknown>;
   sendDocument(chatId: number | string, file: string, extra?: Record<string, unknown>): Promise<unknown>;
   sendVideo(chatId: number | string, file: string, extra?: Record<string, unknown>): Promise<unknown>;
+  sendVideoNote(chatId: number | string, file: string, extra?: Record<string, unknown>): Promise<unknown>;
 }
 
 const MIN_INTERVAL_MS = Math.ceil(1000 / config.notifyRatePerSec);
@@ -47,6 +46,25 @@ const FAR_FUTURE = '9999-12-31T23:59:59.999Z';
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * sleep(ms) that also resolves the moment `signal` aborts — so a long flood-control
+ * wait (Telegram retry_after can be tens of seconds) doesn't pin shutdown past the
+ * platform's SIGTERM→SIGKILL grace window. Returns early on abort; the caller
+ * re-checks `stopped()` and breaks without consuming the row's retry budget.
+ */
+function interruptibleSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    signal?.addEventListener('abort', done, { once: true });
+  });
+}
+
 /** Backoff for the Nth attempt (1-based): 5s, 10s, 20s, … capped at 5 min. */
 function backoffMs(attempt: number): number {
   return Math.min(BACKOFF_BASE_MS * 2 ** (attempt - 1), BACKOFF_CAP_MS);
@@ -60,7 +78,8 @@ function retryAfterMs(err: unknown): number | null {
 }
 
 function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  if (err instanceof Error) return err.message || err.name || String(err);
+  return String(err);
 }
 
 function isoIn(ms: number): string {
@@ -83,6 +102,9 @@ export async function sendMedia(
   media: { kind: MediaKind; fileId: string; caption?: string },
   extra?: Record<string, unknown>,
 ): Promise<void> {
+  // sendVideoNote takes no caption (the Bot API has none for video notes) —
+  // only the markup/extra passes through.
+  if (media.kind === 'video_note') return void (await sender.sendVideoNote(chat, media.fileId, extra));
   const opts = { caption: media.caption, ...extra };
   if (media.kind === 'photo') await sender.sendPhoto(chat, media.fileId, opts);
   else if (media.kind === 'video') await sender.sendVideo(chat, media.fileId, opts);
@@ -115,32 +137,58 @@ async function paceSend(): Promise<void> {
  * how many rows were attempted (0 means the queue is idle). `now` is injectable so
  * drainNotifications can force all rows due without waiting out real backoff.
  */
-async function processDue(sender: Sender, opts: { now?: string; limit?: number } = {}): Promise<number> {
+async function processDue(
+  sender: Sender,
+  opts: { now?: string; limit?: number; stopped?: () => boolean; signal?: AbortSignal } = {},
+): Promise<number> {
   const now = opts.now ?? new Date().toISOString();
-  const due = claimDue(now, opts.limit ?? BATCH);
+  const due = await claimDue(now, opts.limit ?? BATCH);
+  // Chats that returned a 429 this pass. We skip their remaining rows to keep each
+  // recipient's messages in order (a later row must not overtake the queued one
+  // that flooded), while still serving OTHER chats — a per-chat pause, not a
+  // whole-batch stall, so one flooded chat can't starve the rest of the queue.
+  const floodedChats = new Set<string>();
   for (const row of due) {
+    // Shutdown mid-batch: stop between sends. Unsent claimed rows stay
+    // 'queued' and the next boot re-claims them — no send is interrupted and
+    // nothing is lost, but the process doesn't hold shutdown for a full batch.
+    if (opts.stopped?.()) break;
+    // This chat already deferred a row this pass (429 or a transient retry):
+    // leave this one queued in order rather than delivering it ahead of the
+    // earlier row that failed. A later message must never overtake an earlier
+    // one to the same recipient (e.g. an "unassigned" DM before its "assigned").
+    if (floodedChats.has(row.chat_id)) continue;
+    // Erasure (/forget) may have deleted this claimed row since the batch was
+    // claimed — skip anything no longer queued BEFORE spending a pacing interval
+    // on it, rather than deliver data the admin was just told was purged.
+    if (!(await isStillQueued(row.id))) continue;
     await paceSend();
-    // Erasure (/forget) may have deleted this claimed row while earlier rows
-    // in the batch were being paced and sent — skip anything no longer queued
-    // rather than deliver data the admin was just told was purged.
-    if (!isStillQueued(row.id)) continue;
     try {
       await deliver(sender, row);
-      markSent(row.id);
+      await markSent(row.id);
     } catch (err) {
       const wait = retryAfterMs(err);
       const nextAttempt = row.attempts + 1;
       if (wait !== null) {
-        // Flood control: a 429 is a bot-wide "slow down", not a delivery failure.
-        // Pause the whole worker for the requested time and leave the row queued
-        // (still due) — it retries next pass without consuming the retry budget.
-        await sleep(wait);
+        // Flood control: a 429 is "slow down", not a delivery failure. Sleep out
+        // the window, leave this row queued (no retry budget consumed), and skip
+        // the rest of THIS chat's rows this pass — but keep serving other chats.
+        // Interruptible so shutdown doesn't wait out a multi-second retry_after.
+        await interruptibleSleep(wait, opts.signal);
         lastSentAt = Date.now();
+        floodedChats.add(row.chat_id);
       } else if (nextAttempt >= MAX_ATTEMPTS) {
-        markFailed(row.id, errMsg(err));
+        await markFailed(row.id, errMsg(err));
         console.error(`[notify-worker] gave up on notification ${row.id} after ${nextAttempt} attempts: ${errMsg(err)}`);
       } else {
-        markRetry(row.id, errMsg(err), isoIn(backoffMs(nextAttempt)));
+        const retryAt = isoIn(backoffMs(nextAttempt));
+        await markRetry(row.id, errMsg(err), retryAt);
+        // Push this chat's later queued rows out to at least this row's new attempt
+        // time, so a subsequent pass can't deliver a later message before the one we
+        // just deferred (claimDue would otherwise skip the future retry row and pick
+        // the still-due later one). Then skip the rest of this chat this pass too.
+        await deferChatRowsAfter(row.chat_id, row.id, retryAt);
+        floodedChats.add(row.chat_id);
       }
     }
   }
@@ -160,71 +208,61 @@ export async function drainNotifications(sender: Sender, maxPasses = 1000): Prom
 
 // Retention for delivered/failed rows: enough to debug delivery issues, not an
 // unbounded PII archive. Runs at startup and then daily from the worker tick.
-const RETENTION_DAYS = 30;
+// Exported so /privacy states this number instead of hardcoding its own copy.
+export const RETENTION_DAYS = 30;
 const PRUNE_EVERY_MS = 24 * 60 * 60 * 1000;
 let lastPrunedAt = 0;
 
-function maybePrune(): void {
+async function maybePrune(): Promise<void> {
   if (Date.now() - lastPrunedAt < PRUNE_EVERY_MS) return;
   lastPrunedAt = Date.now();
-  const pruned = pruneFinished(isoIn(-RETENTION_DAYS * 24 * 60 * 60 * 1000));
+  const pruned = await pruneFinished(isoIn(-RETENTION_DAYS * 24 * 60 * 60 * 1000));
   if (pruned > 0) console.log(`[notify-worker] pruned ${pruned} finished notification(s) older than ${RETENTION_DAYS}d`);
 }
 
-// Same daily cadence as pruning: an on-volume snapshot (weekday rotation, see
-// backupDb). A failure is logged but never stops delivery — stale backups are
-// an ops alert, not an outage.
-let lastBackupAt = 0;
-
-async function maybeBackup(): Promise<void> {
-  if (Date.now() - lastBackupAt < PRUNE_EVERY_MS) return;
-  lastBackupAt = Date.now();
-  try {
-    const file = await backupDb();
-    console.log(`[notify-worker] database backed up to ${file}`);
-  } catch (err) {
-    console.error('[notify-worker] database backup FAILED:', errMsg(err));
-    // Railway has no log-content alerting, so the alert IS a notification: DM
-    // every admin through the queue. Sound even though the queue lives in the
-    // same database — a failed *backup* (target file, disk space) doesn't mean
-    // the live DB stopped working. Deduped per admin per day, restart-safe.
-    const day = new Date().toISOString().slice(0, 10);
-    for (const adminId of config.adminIds) {
-      enqueue({
-        dedupKey: `backup-failed:${day}:${adminId}`,
-        chatId: String(adminId),
-        subjectId: null, // ops content, names no one
-        text: t(contributorLocale(adminId), 'notify.backupFailed', { error: errMsg(err).slice(0, 300) }),
-      });
-    }
-  }
-}
+// Database backups are the platform's responsibility (Railway managed backups /
+// PITR) — the app no longer snapshots the database itself.
 
 let running = false;
 let timer: ReturnType<typeof setTimeout> | null = null;
+// The in-flight tick, so stopWorker can await it: clearing the timer alone
+// would leave a running processDue issuing queries while shutdown closes the
+// pool under it — the mid-batch send would fail markSent and be re-delivered
+// on the next boot.
+let inFlight: Promise<void> | null = null;
+// Aborted by stopWorker to cut short an in-flight flood-control sleep, so
+// `await inFlight` returns promptly instead of holding shutdown for a full
+// Telegram retry_after.
+let stopController: AbortController | null = null;
 
 /** Start the background worker (idempotent). Ticks until stopWorker() is called. */
 export function startWorker(sender: Sender): void {
   if (running) return;
   running = true;
+  stopController = new AbortController();
+  const signal = stopController.signal;
   const tick = async (): Promise<void> => {
     if (!running) return;
     let attempted = 0;
     try {
-      maybePrune();
-      await maybeBackup();
-      attempted = await processDue(sender);
+      await maybePrune();
+      attempted = await processDue(sender, { stopped: () => !running, signal });
     } catch (err) {
       console.error('[notify-worker] tick failed:', errMsg(err));
     }
     if (!running) return;
-    timer = setTimeout(tick, attempted > 0 ? 0 : IDLE_MS);
+    timer = setTimeout(() => {
+      inFlight = tick();
+    }, attempted > 0 ? 0 : IDLE_MS);
   };
-  void tick();
+  inFlight = tick();
 }
 
-export function stopWorker(): void {
+/** Stop ticking and wait out the in-flight tick — after this the pool is safe to close. */
+export async function stopWorker(): Promise<void> {
   running = false;
   if (timer) clearTimeout(timer);
   timer = null;
+  stopController?.abort(); // wake an in-flight flood-control sleep
+  await inFlight;
 }

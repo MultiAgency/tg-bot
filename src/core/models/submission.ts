@@ -1,14 +1,14 @@
-import { db, nowIso } from '../db.js';
+import { one, many, run, nowIso } from '../db.js';
 import { SubmissionStatus } from '../workflow.js';
 
-export type SubmissionType = 'text' | 'link' | 'file' | 'screenshot' | 'video';
+export type SubmissionType = 'text' | 'link' | 'file' | 'screenshot' | 'video' | 'video_note';
 
 /** The types whose content is a Telegram file_id, delivered as a media message. */
-export type MediaSubmissionType = 'file' | 'screenshot' | 'video';
+export type MediaSubmissionType = 'file' | 'screenshot' | 'video' | 'video_note';
 
 /** True when a submission's content is a file_id to re-send, not text to render. */
 export function isMediaSubmission(type: SubmissionType): type is MediaSubmissionType {
-  return type === 'file' || type === 'screenshot' || type === 'video';
+  return type === 'file' || type === 'screenshot' || type === 'video' || type === 'video_note';
 }
 
 export interface Submission {
@@ -24,66 +24,56 @@ export interface Submission {
   updated_at: string;
 }
 
-const nextVersionStmt = db.prepare(
-  'SELECT COALESCE(MAX(version), 0) + 1 AS v FROM submissions WHERE application_id = ?',
-);
-const insertStmt = db.prepare(`
-  INSERT INTO submissions (application_id, version, type, content, caption, status, created_at, updated_at)
-  VALUES (@application_id, @version, @type, @content, @caption, @status, @now, @now)
-`);
-const getStmt = db.prepare('SELECT * FROM submissions WHERE id = ?');
-
-/** Record a new submission version for an application (v1, v2, …). */
-export function createSubmission(
+/**
+ * Record a new submission version for an application (v1, v2, …). Runs inside the
+ * caller's transaction (service.submitWork), so the MAX(version)+1 read and the
+ * insert are atomic; UNIQUE(application_id, version) backstops any rare race.
+ */
+export async function createSubmission(
   applicationId: number,
   type: SubmissionType,
   content: string,
   caption: string | null,
-): Submission {
-  const { v } = nextVersionStmt.get(applicationId) as { v: number };
-  const info = insertStmt.run({
-    application_id: applicationId,
-    version: v,
-    type,
-    content,
-    caption,
-    status: SubmissionStatus.Submitted,
-    now: nowIso(),
-  });
-  return getSubmission(Number(info.lastInsertRowid))!;
+): Promise<Submission> {
+  const { v } = (await one<{ v: number }>(
+    'SELECT COALESCE(MAX(version), 0) + 1 AS v FROM submissions WHERE application_id = $1',
+    [applicationId],
+  ))!;
+  return (await one<Submission>(
+    `INSERT INTO submissions (application_id, version, type, content, caption, status, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+     RETURNING *`,
+    [applicationId, v, type, content, caption, SubmissionStatus.Submitted, nowIso()],
+  ))!;
 }
 
-export function getSubmission(id: number): Submission | undefined {
-  return getStmt.get(id) as Submission | undefined;
+export async function getSubmission(id: number): Promise<Submission | undefined> {
+  return one<Submission>('SELECT * FROM submissions WHERE id = $1', [id]);
 }
 
-const latestStmt = db.prepare(
-  'SELECT * FROM submissions WHERE application_id = ? ORDER BY version DESC LIMIT 1',
-);
-const byApplicationStmt = db.prepare(
-  'SELECT * FROM submissions WHERE application_id = ? ORDER BY version ASC',
-);
+export const latestForApplication = (applicationId: number): Promise<Submission | undefined> =>
+  one<Submission>('SELECT * FROM submissions WHERE application_id = $1 ORDER BY version DESC LIMIT 1', [applicationId]);
 
-export const latestForApplication = (applicationId: number): Submission | undefined =>
-  latestStmt.get(applicationId) as Submission | undefined;
-export const listByApplication = (applicationId: number): Submission[] =>
-  byApplicationStmt.all(applicationId) as Submission[];
+/** Latest submission per application for a set of applications, in one round trip (listing commands). */
+export const latestForApplications = (applicationIds: number[]): Promise<Submission[]> =>
+  many<Submission>(
+    `SELECT DISTINCT ON (application_id) *
+     FROM submissions WHERE application_id = ANY($1)
+     ORDER BY application_id, version DESC`,
+    [applicationIds],
+  );
+export const listByApplication = (applicationId: number): Promise<Submission[]> =>
+  many<Submission>('SELECT * FROM submissions WHERE application_id = $1 ORDER BY version ASC', [applicationId]);
 
-const byStatusStmt = db.prepare(
-  'SELECT * FROM submissions WHERE status = ? ORDER BY created_at ASC, id ASC',
-);
-export const listByStatus = (status: SubmissionStatus): Submission[] =>
-  byStatusStmt.all(status) as Submission[];
+export const listByStatus = (status: SubmissionStatus): Promise<Submission[]> =>
+  many<Submission>('SELECT * FROM submissions WHERE status = $1 ORDER BY created_at ASC, id ASC', [status]);
 
-const countByStatusStmt = db.prepare('SELECT COUNT(*) AS n FROM submissions WHERE status = ?');
+export const countByStatus = async (status: SubmissionStatus): Promise<number> =>
+  (await one<{ n: number }>('SELECT COUNT(*) AS n FROM submissions WHERE status = $1', [status]))!.n;
 
-export const countByStatus = (status: SubmissionStatus): number =>
-  (countByStatusStmt.get(status) as { n: number }).n;
-
-const setReviewStmt = db.prepare(`
-  UPDATE submissions SET status = @status, reviewer_note = @note, updated_at = @now WHERE id = @id
-`);
-
-export function setReview(id: number, status: SubmissionStatus, note: string | null): void {
-  setReviewStmt.run({ id, status, note, now: nowIso() });
+export async function setReview(id: number, status: SubmissionStatus, note: string | null): Promise<Submission> {
+  return (await one<Submission>(
+    'UPDATE submissions SET status = $1, reviewer_note = $2, updated_at = $3 WHERE id = $4 RETURNING *',
+    [status, note, nowIso(), id],
+  ))!;
 }

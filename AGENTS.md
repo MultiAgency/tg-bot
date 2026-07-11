@@ -1,6 +1,6 @@
 # Agent instructions
 
-Telegram bot (Telegraf + better-sqlite3, TypeScript ESM, Node 22+) that
+Telegram bot (Telegraf + PostgreSQL via `pg`, TypeScript ESM, Node 22+) that
 coordinates contributor work through a human-in-the-loop **apply → assign →
 versioned submit → review** workflow, modelled as three state machines (task,
 application, submission — see `src/core/workflow.ts`). Read `README.md` for
@@ -9,18 +9,21 @@ the full picture, `SCOPE.md` for what is deliberately out of scope.
 ## Commands
 
 ```bash
-npm test            # the full gate: typecheck, build, then all four demo suites
+npm test            # the full gate: typecheck, build, then all five demo suites
 npm run typecheck   # tsc --noEmit
 npm run build       # tsc → dist/
 npm run demo        # end-to-end run of DEMO.md with the network stubbed
-npm run edge-demo   # adversarial edges: Telegram limits, groups, races, backups
+npm run edge-demo   # adversarial edges: Telegram limits, groups, races, migrations
+npm run rooms-demo  # rooms, room admins, signal detection (AI endpoint stubbed)
 npm run dev         # tsx watch (needs a real BOT_TOKEN in .env)
 ```
 
 `npm test` is the check that matters — CI runs exactly it. `npm run demo`
 drives the real middleware, scenes, and buttons against a throwaway database;
-`core-demo` and `queue-demo` cover the service layer and delivery queue; and
-`edge-demo`'s transport stub rejects over-limit messages like the live API.
+`core-demo` and `queue-demo` cover the service layer and delivery queue;
+`edge-demo`'s transport stub rejects over-limit messages like the live API;
+and `rooms-demo` stubs the NEAR AI endpoint at `globalThis.fetch` (the real
+OpenAI SDK client still runs) to drive signal detection deterministically.
 
 ## Architecture rules
 
@@ -35,7 +38,21 @@ drives the real middleware, scenes, and buttons against a throwaway database;
   *role* — new call paths must apply the admin/ownership check first.
 - **AI (`src/ai/assist.ts`) is advisory only.** Helpers return `null` on any
   failure or missing key, and callers must degrade gracefully. AI output is
-  never allowed to trigger a state transition.
+  never allowed to trigger a state transition. Signal detection creates
+  *Drafts* only — the human `/approve` step is the boundary; never let a
+  signal open a task.
+- **Signals store no message text and no author identity.** A signal row is
+  room + score + outcome, nothing else, and signal-drafted tasks keep
+  `created_by = NULL` — `/privacy` promises that people who only chat in a
+  group with the bot are never recorded. Don't add text/author columns to
+  `signals` without treating it as a privacy change.
+- **Role gating is room-aware.** Global admins (`ADMIN_IDS`) manage everything;
+  room admins (`room_admins` table) manage only tasks whose `room_chat_id` is a
+  room they administer — enforced in `src/bot/index.ts` via `canManageTask` /
+  `requireManagerCmd` (commands) and `requireManageCb` (buttons). Task-scoped
+  notifications fan out via `enqueueForManagers` (global admins ∪ that room's
+  admins), not `enqueueForAdmins`. `/newtask`, `/admin`, and `/forget` stay
+  global-admin-only.
 - **Submissions are immutable versions** — a revision is a new row, never an
   update of the old one. The only deletion path is `/forget` (right-to-erasure),
   which must also scrub history *details* (pitches, "contributor N" mentions),
@@ -67,19 +84,29 @@ drives the real middleware, scenes, and buttons against a throwaway database;
 - Telegraf handles a `getUpdates` batch concurrently; wizard session state is
   only safe because `perUserQueue` in `src/bot/index.ts` serializes per-user
   updates. Don't remove or bypass it.
-- Wizard sessions are in-memory; durable state lives only in SQLite.
+- Wizard sessions are in-memory; durable state lives only in Postgres.
 - Only one process may long-poll a bot token — never run two instances
   (including local dev against the deployed token).
-- The DB layer (`better-sqlite3`) is synchronous by design, and the whole
-  service layer with it. Don't introduce an async DB driver casually — it
-  ripples through every caller.
+- Signal detection only sees group texts if the bot is an admin of that group
+  or global privacy mode is off — under the default privacy mode the listener
+  simply never fires (no error, no log).
+- The DB layer (`src/core/db.ts`) runs on a `pg` Pool at READ COMMITTED, so a
+  check-then-write is NOT atomic by default the way it was under synchronous
+  better-sqlite3. A service mutator wraps its work in `withTransaction()`
+  (nested calls join the outer transaction via AsyncLocalStorage — models never
+  receive a client) and takes a row lock (`SELECT … FOR UPDATE`, see
+  `getApplicationForUpdate` / `getTaskForUpdate` / `getRoomForUpdate` /
+  `getContributorForUpdate`) on the row whose state it guards, as its FIRST
+  read. New mutators must follow the same pattern or concurrent taps will
+  double-apply.
 - User-facing strings are being centralized in `src/bot/locales/` behind
   `t()`/`localeOf()` (`src/bot/i18n.ts`); prefer adding new strings there
   rather than inline.
 
 ## Environment
 
-Copy `.env.example` → `.env`. `BOT_TOKEN` is required (startup throws without
-it). An empty `ADMIN_IDS` only logs a warning — the bot runs, but no one can
-create, approve, or review tasks. The NEAR AI variables are optional (AI
-features switch off cleanly without them).
+Copy `.env.example` → `.env`. `BOT_TOKEN` and `DATABASE_URL` are required
+(startup throws without them); local dev and the demo suites use the
+docker-compose Postgres (see README). An empty `ADMIN_IDS` only logs a
+warning — the bot runs, but no one can create, approve, or review tasks. The
+NEAR AI variables are optional (AI features switch off cleanly without them).

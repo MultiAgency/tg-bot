@@ -16,11 +16,12 @@ export const applyButton = (task: Task, locale: string) =>
   Markup.inlineKeyboard([Markup.button.callback(t(locale, 'btn.apply', { id: task.id }), `apply:${task.id}`)]);
 
 /**
- * Apply button for the public announcement channel: a deep link into the bot's
- * private chat (?start=t<id> is handled in bot.start), since the pitch wizard
- * can't run inside a channel. Needs the bot's @username.
+ * Apply button as a deep link into the bot's private chat (?start=t<id> is
+ * handled in bot.start) — used wherever the pitch wizard can't run in place:
+ * the announcement channel and group chats, since neither delivers the
+ * free-form replies the wizard collects. Needs the bot's @username.
  */
-export const announceApplyButton = (task: Task, botUsername: string, locale: string) =>
+export const deepLinkApplyButton = (task: Task, botUsername: string, locale: string) =>
   Markup.inlineKeyboard([
     Markup.button.url(t(locale, 'btn.apply', { id: task.id }), `https://t.me/${botUsername}?start=t${task.id}`),
   ]);

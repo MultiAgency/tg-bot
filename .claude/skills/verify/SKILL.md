@@ -9,11 +9,12 @@ The user surface is Telegram; there is no test account. The deepest reachable
 surface is Telegraf's real update boundary: feed update objects through
 `bot.handleUpdate(...)` and stub the HTTPS transport at
 `Object.getPrototypeOf(bot.telegram).callApi`. Everything else — middleware,
-per-user queue, sessions, scenes, i18n, SQLite, the notification worker — runs
-for real. `scripts/demo-loop.ts` is the canonical example of the technique, and
+per-user queue, sessions, scenes, i18n, Postgres, the notification worker — runs
+for real. `scripts/harness.ts` holds the shared transport stub and update
+factories; `scripts/demo-loop.ts` is the canonical example of the technique, and
 `scripts/edge-demo.ts` (npm run edge-demo) is the adversarial variant — its
 stub throws on over-limit messages like the live API, and it covers groups,
-albums, erasure races, and backups. Extend it rather than writing a scratch
+albums, erasure races, and migrations. Extend it rather than writing a scratch
 driver when verifying new edge behavior.
 
 ## Recipe
@@ -22,10 +23,12 @@ driver when verifying new edge behavior.
   import repo sources by absolute path with explicit `.ts` extensions
   (`await import('/abs/path/src/bot/index.ts')`) and run with `npx tsx` from
   the repo root so `node_modules` resolves.
-- Env: `BOT_TOKEN=000000:verify DATABASE_PATH=<fresh .sqlite> ADMIN_IDS=1
+- Env: `BOT_TOKEN=000000:verify DATABASE_URL=postgresql://multiagency:multiagency@localhost:5455/multiagency_test ADMIN_IDS=1
   BOT_USERNAME=DemoBot NEAR_AI_API_KEY= NOTIFY_RATE_PER_SEC=1000`
-  (empty AI key disables AI; high rate makes worker pacing ~1ms).
-  Delete the DB (and `-shm`/`-wal`) between runs.
+  (empty AI key disables AI; high rate makes worker pacing ~1ms). Point
+  DATABASE_URL at the throwaway test DB (docker compose provides it). Start each
+  run with `await resetDb()` (from `scripts/testdb.ts`) for a clean schema — it
+  DROPs and recreates `public`, guarded so it only runs against a local/test URL.
 - Set `bot.botInfo = { id: 999, is_bot: true, first_name: 'X', username: 'DemoBot' }`
   or command parsing breaks.
 - Make the `callApi` stub **throw on `text.length > 4096` and
@@ -40,8 +43,9 @@ driver when verifying new edge behavior.
   `caption`). Buttons: `callback_query` with `data` and a stub `message`.
 - Queue behavior: producers only enqueue; call
   `drainNotifications(bot.telegram)` (from `src/bot/worker.ts`) to deliver.
-  To test races, trigger side effects from inside the `callApi` stub
-  (better-sqlite3 is synchronous, so e.g. `forgetContributor()` mid-send works).
+  To test races, set the harness's `onApi` hook (awaited inside the `callApi`
+  stub), so an async mutation like `forgetContributor()` fired mid-send commits
+  before the next delivery.
 
 ## Flows worth driving
 

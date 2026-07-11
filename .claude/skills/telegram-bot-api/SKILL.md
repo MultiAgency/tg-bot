@@ -88,4 +88,4 @@ Payments (Telegram Stars), HTML5 games, stickers, and bot-to-bot/guest/secretary
 - Never claim delivery you didn't verify — bot-initiated pushes only enqueue;
   delivery status lives on the notification row (queue health surfaces in `/admin`).
 - Verify changes end-to-end with `npm test` — `demo` drives the real bot layer
-  with a stubbed network; `edge-demo` covers limits, groups, races, and backups.
+  with a stubbed network; `edge-demo` covers limits, groups, races, and migrations.

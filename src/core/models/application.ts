@@ -1,4 +1,4 @@
-import { db, nowIso } from '../db.js';
+import { one, many, run, nowIso } from '../db.js';
 import { ApplicationStatus } from '../workflow.js';
 
 export interface Application {
@@ -11,98 +11,112 @@ export interface Application {
   updated_at: string;
 }
 
-const insertStmt = db.prepare(`
-  INSERT INTO applications (task_id, contributor_id, pitch, status, created_at, updated_at)
-  VALUES (@task_id, @contributor_id, @pitch, @status, @now, @now)
-`);
-
-const getStmt = db.prepare('SELECT * FROM applications WHERE id = ?');
-const byTaskContribStmt = db.prepare(
-  'SELECT * FROM applications WHERE task_id = ? AND contributor_id = ?',
-);
-
-export function createApplication(taskId: number, contributorId: number, pitch: string | null): Application {
-  const info = insertStmt.run({
-    task_id: taskId,
-    contributor_id: contributorId,
-    pitch,
-    status: ApplicationStatus.Applied,
-    now: nowIso(),
-  });
-  return getApplication(Number(info.lastInsertRowid))!;
+export async function createApplication(
+  taskId: number,
+  contributorId: number,
+  pitch: string | null,
+): Promise<Application> {
+  return (await one<Application>(
+    `INSERT INTO applications (task_id, contributor_id, pitch, status, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $5)
+     RETURNING *`,
+    [taskId, contributorId, pitch, ApplicationStatus.Applied, nowIso()],
+  ))!;
 }
 
-export function getApplication(id: number): Application | undefined {
-  return getStmt.get(id) as Application | undefined;
+export async function getApplication(id: number): Promise<Application | undefined> {
+  return one<Application>('SELECT * FROM applications WHERE id = $1', [id]);
 }
 
-export function getApplicationFor(taskId: number, contributorId: number): Application | undefined {
-  return byTaskContribStmt.get(taskId, contributorId) as Application | undefined;
+/** Fetch many applications by id in one round trip (listing commands avoid N+1). */
+export const listByIds = (ids: number[]): Promise<Application[]> =>
+  many<Application>('SELECT * FROM applications WHERE id = ANY($1)', [ids]);
+
+/**
+ * Fetch an application with a row lock (SELECT … FOR UPDATE). Must be called
+ * inside a transaction. Every application mutator takes this lock as its FIRST
+ * read: concurrent decisions on the same application (assign vs decline,
+ * unassign vs submit, two reviews) serialize on it — under READ COMMITTED both
+ * would otherwise pass their status guards and double-apply counter updates.
+ */
+export async function getApplicationForUpdate(id: number): Promise<Application | undefined> {
+  return one<Application>('SELECT * FROM applications WHERE id = $1 FOR UPDATE', [id]);
 }
 
-const byTaskStatusStmt = db.prepare(
-  'SELECT * FROM applications WHERE task_id = ? AND status = ? ORDER BY created_at ASC, id ASC',
-);
-const byContributorStmt = db.prepare(
-  'SELECT * FROM applications WHERE contributor_id = ? ORDER BY updated_at DESC, id DESC',
-);
+export async function getApplicationFor(taskId: number, contributorId: number): Promise<Application | undefined> {
+  return one<Application>('SELECT * FROM applications WHERE task_id = $1 AND contributor_id = $2', [taskId, contributorId]);
+}
 
-export const listByTaskStatus = (taskId: number, status: ApplicationStatus): Application[] =>
-  byTaskStatusStmt.all(taskId, status) as Application[];
-export const listByContributor = (contributorId: number): Application[] =>
-  byContributorStmt.all(contributorId) as Application[];
+/**
+ * Find AND lock a contributor's application to a task in one round trip (there is
+ * at most one — UNIQUE(task_id, contributor_id)). Used by apply()'s re-apply
+ * path: a single locked lookup, so the row can't be deleted between an unlocked
+ * find and taking the lock (which would drop apply() into a spurious create).
+ */
+export async function getApplicationForUpdateBy(taskId: number, contributorId: number): Promise<Application | undefined> {
+  return one<Application>(
+    'SELECT * FROM applications WHERE task_id = $1 AND contributor_id = $2 FOR UPDATE',
+    [taskId, contributorId],
+  );
+}
+
+/**
+ * Lock all of a contributor's application rows (ordered, for a stable lock
+ * sequence). Erasure takes this FIRST so it acquires application locks before the
+ * contributor-row lock — the same app→contributor order every counter-bumping
+ * mutator uses, which is what keeps the two from deadlocking (Postgres 40P01).
+ */
+export async function lockByContributor(contributorId: number): Promise<void> {
+  await many('SELECT id FROM applications WHERE contributor_id = $1 ORDER BY id FOR UPDATE', [contributorId]);
+}
+
+export const listByTaskStatus = (taskId: number, status: ApplicationStatus): Promise<Application[]> =>
+  many<Application>('SELECT * FROM applications WHERE task_id = $1 AND status = $2 ORDER BY created_at ASC, id ASC', [taskId, status]);
+export const listByContributor = (contributorId: number): Promise<Application[]> =>
+  many<Application>('SELECT * FROM applications WHERE contributor_id = $1 ORDER BY updated_at DESC, id DESC', [contributorId]);
 
 // Global (across all tasks), stalest first — for the admin /active board.
-const byStatusAllStmt = db.prepare(
-  'SELECT * FROM applications WHERE status = ? ORDER BY updated_at ASC, id ASC',
-);
-export const listByStatusAll = (status: ApplicationStatus): Application[] =>
-  byStatusAllStmt.all(status) as Application[];
+export const listByStatusAll = (status: ApplicationStatus): Promise<Application[]> =>
+  many<Application>('SELECT * FROM applications WHERE status = $1 ORDER BY updated_at ASC, id ASC', [status]);
 
-const countTaskStatusStmt = db.prepare(
-  'SELECT COUNT(*) AS n FROM applications WHERE task_id = ? AND status = ?',
-);
-const countStatusAllStmt = db.prepare(
-  'SELECT COUNT(*) AS n FROM applications WHERE status = ?',
-);
-const countStatusPerTaskStmt = db.prepare(
-  'SELECT task_id, COUNT(*) AS n FROM applications WHERE status = ? GROUP BY task_id ORDER BY task_id ASC',
-);
-const countContribStatusStmt = db.prepare(
-  'SELECT COUNT(*) AS n FROM applications WHERE contributor_id = ? AND status = ?',
-);
+/** COUNT for several statuses at once (e.g. slots taken = assigned + completed) in one round trip. */
+export const countByTaskStatuses = async (taskId: number, statuses: ApplicationStatus[]): Promise<number> =>
+  (await one<{ n: number }>('SELECT COUNT(*) AS n FROM applications WHERE task_id = $1 AND status = ANY($2)', [taskId, statuses]))!.n;
+/** Slots taken (assigned + completed) for many tasks at once — one grouped round trip for a listing page. */
+export const countByTaskStatusesForTasks = (
+  taskIds: number[],
+  statuses: ApplicationStatus[],
+): Promise<{ task_id: number; n: number }[]> =>
+  many<{ task_id: number; n: number }>(
+    'SELECT task_id, COUNT(*) AS n FROM applications WHERE task_id = ANY($1) AND status = ANY($2) GROUP BY task_id',
+    [taskIds, statuses],
+  );
+export const countByStatusAll = async (status: ApplicationStatus): Promise<number> =>
+  (await one<{ n: number }>('SELECT COUNT(*) AS n FROM applications WHERE status = $1', [status]))!.n;
+export const countByStatusPerTask = (status: ApplicationStatus): Promise<{ task_id: number; n: number }[]> =>
+  many<{ task_id: number; n: number }>(
+    'SELECT task_id, COUNT(*) AS n FROM applications WHERE status = $1 GROUP BY task_id ORDER BY task_id ASC',
+    [status],
+  );
+export const countByContributorStatus = async (contributorId: number, status: ApplicationStatus): Promise<number> =>
+  (await one<{ n: number }>('SELECT COUNT(*) AS n FROM applications WHERE contributor_id = $1 AND status = $2', [contributorId, status]))!.n;
 
-export const countByTaskStatus = (taskId: number, status: ApplicationStatus): number =>
-  (countTaskStatusStmt.get(taskId, status) as { n: number }).n;
-export const countByStatusAll = (status: ApplicationStatus): number =>
-  (countStatusAllStmt.get(status) as { n: number }).n;
-export const countByStatusPerTask = (status: ApplicationStatus): { task_id: number; n: number }[] =>
-  countStatusPerTaskStmt.all(status) as { task_id: number; n: number }[];
-export const countByContributorStatus = (contributorId: number, status: ApplicationStatus): number =>
-  (countContribStatusStmt.get(contributorId, status) as { n: number }).n;
-
-const setStatusStmt = db.prepare(
-  'UPDATE applications SET status = @status, updated_at = @now WHERE id = @id',
-);
-
-export function setStatus(id: number, status: ApplicationStatus): void {
-  setStatusStmt.run({ id, status, now: nowIso() });
+export async function setStatus(id: number, status: ApplicationStatus): Promise<Application> {
+  return (await one<Application>(
+    'UPDATE applications SET status = $1, updated_at = $2 WHERE id = $3 RETURNING *',
+    [status, nowIso(), id],
+  ))!;
 }
-
-const reapplyStmt = db.prepare(
-  'UPDATE applications SET status = @status, pitch = @pitch, updated_at = @now WHERE id = @id',
-);
 
 /** Re-open a declined/withdrawn application with the contributor's new pitch. */
-export function reapply(id: number, pitch: string | null): void {
-  reapplyStmt.run({ id, status: ApplicationStatus.Applied, pitch, now: nowIso() });
+export async function reapply(id: number, pitch: string | null): Promise<Application> {
+  return (await one<Application>(
+    'UPDATE applications SET status = $1, pitch = $2, updated_at = $3 WHERE id = $4 RETURNING *',
+    [ApplicationStatus.Applied, pitch, nowIso(), id],
+  ))!;
 }
 
-const clearForContributorStmt = db.prepare(
-  'DELETE FROM applications WHERE contributor_id = ?',
-);
-
 /** Used by erasure: drop all of a contributor's applications. */
-export function deleteByContributor(contributorId: number): number {
-  return clearForContributorStmt.run(contributorId).changes;
+export async function deleteByContributor(contributorId: number): Promise<number> {
+  return run('DELETE FROM applications WHERE contributor_id = $1', [contributorId]);
 }

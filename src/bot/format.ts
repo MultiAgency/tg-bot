@@ -3,7 +3,7 @@ import type { Application } from '../core/models/application.js';
 import { isMediaSubmission, type Submission } from '../core/models/submission.js';
 import type { HistoryEntry } from '../core/models/history.js';
 import { TaskStatus, ApplicationStatus, SubmissionStatus } from '../core/workflow.js';
-import { getContributor, contributorLabel, type Contributor } from '../core/service.js';
+import { contributorLabel, type Contributor } from '../core/service.js';
 
 const dash = '—';
 
@@ -59,10 +59,12 @@ export function clampCaption(text: string): string {
   return safeSlice(text, 1024);
 }
 
-function who(id: number | null | undefined): string {
-  if (!id) return 'someone';
-  const c = getContributor(id);
-  return c ? contributorLabel(c) : `user ${id}`;
+// Pure: the caller supplies the already-fetched contributor (presentation never
+// queries the DB). `undefined` contributor with a non-null id renders "user N".
+function who(id: number | null | undefined, c?: Contributor): string {
+  if (c) return contributorLabel(c);
+  if (id) return `user ${id}`;
+  return 'someone';
 }
 
 function age(iso: string): string {
@@ -114,8 +116,7 @@ function contributorStats(c: Contributor): string {
 // ---- Applications ----
 
 /** An applicant's pitch plus their track record, for the admin to choose from. */
-export function applicantCard(app: Application): string {
-  const c = getContributor(app.contributor_id);
+export function applicantCard(app: Application, c: Contributor | undefined): string {
   const pitch = app.pitch ? `\n💬 “${truncate(app.pitch, 800)}”` : '\n💬 (no pitch)';
   return clampMessage(
     `${c ? contributorStats(c) : who(app.contributor_id)} · ${applicationStatusLabel(app.status)} · id ${app.id}${pitch}`,
@@ -147,7 +148,8 @@ function clipStored(text: string, max: number): string {
 function describeSubmission(sub: Submission): string {
   if (isMediaSubmission(sub.type)) {
     const cap = sub.caption ? ` — “${clipStored(sub.caption, CAPTION_CLIP)}”` : '';
-    return `(${sub.type === 'video' ? 'video' : 'file'} attachment${cap})`;
+    const label = sub.type === 'video' || sub.type === 'video_note' ? 'video' : 'file';
+    return `(${label} attachment${cap})`;
   }
   return clipStored(sub.content, CONTENT_CLIP);
 }
@@ -183,8 +185,12 @@ export function chunkMessage(text: string): string[] {
 }
 
 /** Full review card: the work, its version, the task, and the worker's record. */
-export function submissionReviewCard(sub: Submission, app: Application, task: Task | undefined): string {
-  const c = getContributor(app.contributor_id);
+export function submissionReviewCard(
+  sub: Submission,
+  app: Application,
+  task: Task | undefined,
+  c: Contributor | undefined,
+): string {
   const lines = [
     task ? `#${task.id} ${truncate(task.title, 200)}` : `task #${app.task_id}`,
     `Required output: ${task?.required_output ? truncate(task.required_output, 400) : dash}`,
@@ -198,10 +204,15 @@ export function submissionReviewCard(sub: Submission, app: Application, task: Ta
 
 // ---- Active board ----
 
-export function activeLine(app: Application, task: Task | undefined, latest?: Submission): string {
+export function activeLine(
+  app: Application,
+  task: Task | undefined,
+  latest: Submission | undefined,
+  c: Contributor | undefined,
+): string {
   const title = task ? truncate(task.title, 90) : `task #${app.task_id}`;
   const state = latest ? submissionStatusLabel(latest.status) : 'not yet submitted';
-  return `• #${app.task_id} ${title} — ${who(app.contributor_id)} · ${state} · updated ${age(app.updated_at)} ago · id ${app.id}`;
+  return `• #${app.task_id} ${title} — ${who(app.contributor_id, c)} · ${state} · updated ${age(app.updated_at)} ago · id ${app.id}`;
 }
 
 // ---- History ----
@@ -225,15 +236,16 @@ const ACTION_LABELS: Record<string, string> = {
   contributor_forgotten: 'contributor erased 🗑️',
 };
 
-export function historyBlock(entries: HistoryEntry[]): string {
+/**
+ * `labels` maps an actor_id to its display label; the caller resolves the task's
+ * distinct actors once (presentation stays pure). A missing id renders "user N".
+ */
+export function historyBlock(entries: HistoryEntry[], labels: ReadonlyMap<number, string>): string {
   if (entries.length === 0) return 'No history yet.';
-  // The same few actors recur across a task's history — resolve each once.
-  const names = new Map<number, string>();
   return entries
     .map((e) => {
       const when = e.created_at.slice(0, 16).replace('T', ' ');
-      const name = e.actor_id ? names.get(e.actor_id) ?? who(e.actor_id) : '';
-      if (e.actor_id && !names.has(e.actor_id)) names.set(e.actor_id, name);
+      const name = e.actor_id ? labels.get(e.actor_id) ?? `user ${e.actor_id}` : '';
       const label = ACTION_LABELS[e.action] ?? e.action;
       // Render the recorded detail (unassign reason, pitch, reviewer note) —
       // it is the audit trail's substance, not just its timestamps.

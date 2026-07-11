@@ -1,5 +1,4 @@
 import 'dotenv/config';
-import { resolve } from 'node:path';
 
 function required(name: string): string {
   const value = process.env[name];
@@ -39,7 +38,9 @@ const adminIds = new Set(
 export const config = {
   botToken: required('BOT_TOKEN'),
   adminIds,
-  databasePath: resolve(process.env.DATABASE_PATH ?? './data/multiagency.sqlite'),
+  // PostgreSQL connection string (Railway injects DATABASE_URL). Local dev/CI use
+  // the docker-compose Postgres; see README.
+  databaseUrl: required('DATABASE_URL'),
   // AI assistance runs on NEAR AI Cloud (OpenAI-compatible API).
   nearAiApiKey: process.env.NEAR_AI_API_KEY ?? '',
   nearAiBaseUrl: process.env.NEAR_AI_BASE_URL ?? 'https://cloud-api.near.ai/v1',
@@ -63,6 +64,13 @@ export const config = {
   // queue by the single delivery worker (Telegram's bulk limit is ~30/s).
   // Fractional rates are honored — sub-1 values are a deliberate slow-down.
   notifyRatePerSec: positiveNumber('NOTIFY_RATE_PER_SEC', 25),
+  // Signal detection (opt-in per group via /enablesignals): minimum AI score
+  // (0–10) a message must reach to become a Draft task — an operator-tunable
+  // gate on top of the model's own judgment.
+  signalScoreThreshold: positiveNumber('SIGNAL_SCORE_THRESHOLD', 6),
+  // Cap on AI evaluations per room per hour, enforced against stored signal
+  // rows so it survives restarts. Bounds the AI bill of a flooded group.
+  signalMaxPerHour: positiveNumber('SIGNAL_MAX_PER_HOUR', 20),
 } as const;
 
 export function isAdmin(telegramId: number | undefined): boolean {

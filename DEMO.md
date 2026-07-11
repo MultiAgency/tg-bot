@@ -7,7 +7,8 @@ one admin (its numeric ID in `ADMIN_IDS`) and one contributor (any account).
 
 1. `cp .env.example .env`, set `BOT_TOKEN` and `ADMIN_IDS` (optionally
    `NEAR_AI_API_KEY`, `ANNOUNCE_CHAT_ID`, and `BOT_USERNAME`).
-2. `npm install && npm run dev`
+2. `npm install && docker compose up -d` (starts local Postgres), then `npm run dev`
+   (migrations apply automatically on boot).
 3. Both accounts open **@MultiAgencyAI_bot** and send `/start`.
 
 ## The loop (~4 minutes per task)
@@ -53,7 +54,10 @@ task; use **Revise** (step 6) when you want another version instead.
 
 ## Known limitations (MVP)
 
-- Single admin pool: everyone in `ADMIN_IDS` can create, approve, assign, and review — no role split.
+- Two admin tiers: everyone in `ADMIN_IDS` manages everything; room admins
+  (added per group) manage their rooms' tasks. No finer role split within a tier.
+- Signal detection needs the bot to receive group texts — promote it to admin
+  in the scanned group (recommended) or turn BotFather privacy mode off.
 - Rewards are free text; no payouts.
 - Deadlines are informational text; nothing expires or reminds automatically.
 - Long-polling single instance; don't run two copies against one token.

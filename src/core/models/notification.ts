@@ -1,4 +1,4 @@
-import { db, nowIso } from '../db.js';
+import { one, many, run, nowIso, withTransaction } from '../db.js';
 
 /**
  * The outbound notification queue. One row = one Telegram message the bot pushes
@@ -9,7 +9,7 @@ import { db, nowIso } from '../db.js';
  */
 
 export type NotificationStatus = 'queued' | 'sent' | 'failed';
-export type MediaKind = 'photo' | 'document' | 'video';
+export type MediaKind = 'photo' | 'document' | 'video' | 'video_note';
 
 export interface NotificationRow {
   id: number;
@@ -48,28 +48,36 @@ export interface NewNotification {
   caption?: string | null;
 }
 
-const insertStmt = db.prepare(`
-  INSERT INTO notifications
-    (dedup_key, chat_id, subject_id, text, reply_markup, media_kind, media_file_id, caption,
-     status, attempts, next_attempt_at, created_at, updated_at)
-  VALUES
-    (@dedup_key, @chat_id, @subject_id, @text, @reply_markup, @media_kind, @media_file_id, @caption,
-     'queued', 0, @now, @now, @now)
-  ON CONFLICT(dedup_key) DO NOTHING
-`);
+// Single source of truth for the notifications INSERT shape, shared by the
+// single-row enqueue and the batched enqueueMany so a schema change can't update
+// one and silently corrupt the other.
+const INSERT_HEAD = `INSERT INTO notifications
+  (dedup_key, chat_id, subject_id, text, reply_markup, media_kind, media_file_id, caption,
+   status, attempts, next_attempt_at, created_at, updated_at)
+  VALUES`;
+const ON_CONFLICT = 'ON CONFLICT (dedup_key) DO NOTHING';
 
-function toRow(n: NewNotification, now: string): Record<string, unknown> {
-  return {
-    dedup_key: n.dedupKey,
-    chat_id: n.chatId,
-    subject_id: n.subjectId,
-    text: n.text ?? null,
-    reply_markup: n.replyMarkup ?? null,
-    media_kind: n.mediaKind ?? null,
-    media_file_id: n.mediaFileId ?? null,
-    caption: n.caption ?? null,
+/** One VALUES tuple (8 bound columns, literal status/attempts, then `now` for the
+ *  three timestamp columns), offset past `base` already-bound params. */
+function valuesTuple(base: number): string {
+  const p = (i: number): string => `$${base + i}`;
+  return `(${p(1)}, ${p(2)}, ${p(3)}, ${p(4)}, ${p(5)}, ${p(6)}, ${p(7)}, ${p(8)}, 'queued', 0, ${p(9)}, ${p(9)}, ${p(9)})`;
+}
+
+const INSERT_SQL = `${INSERT_HEAD} ${valuesTuple(0)} ${ON_CONFLICT}`;
+
+function insertParams(n: NewNotification, now: string): unknown[] {
+  return [
+    n.dedupKey,
+    n.chatId,
+    n.subjectId,
+    n.text ?? null,
+    n.replyMarkup ?? null,
+    n.mediaKind ?? null,
+    n.mediaFileId ?? null,
+    n.caption ?? null,
     now,
-  };
+  ];
 }
 
 /**
@@ -77,75 +85,100 @@ function toRow(n: NewNotification, now: string): Record<string, unknown> {
  * message (e.g. a handler that ran twice) inserts nothing. Returns true if a new
  * row was created, false if it was a duplicate.
  */
-export function enqueue(n: NewNotification): boolean {
-  return insertStmt.run(toRow(n, nowIso())).changes > 0;
+export async function enqueue(n: NewNotification): Promise<boolean> {
+  return (await run(INSERT_SQL, insertParams(n, nowIso()))) > 0;
 }
 
-const enqueueManyTxn = db.transaction((rows: NewNotification[], now: string): number => {
-  let inserted = 0;
-  for (const n of rows) inserted += insertStmt.run(toRow(n, now)).changes;
-  return inserted;
-});
+// Rows per multi-row INSERT: 9 params each keeps a chunk far under Postgres's
+// 65535-parameter statement limit while still batching a launch-sized fan-out
+// into a handful of round trips.
+const ENQUEUE_CHUNK = 500;
 
-/** Enqueue many notifications in one transaction (the announcement DM fan-out). */
-export function enqueueMany(rows: NewNotification[]): number {
-  return enqueueManyTxn(rows, nowIso());
+/**
+ * Enqueue many notifications in one transaction (the announcement DM fan-out).
+ * Batched into multi-row INSERTs — one round trip per ENQUEUE_CHUNK rows, not
+ * per row, so a large fan-out doesn't pin a pool connection for N serial
+ * round trips. (ON CONFLICT DO NOTHING is intra-statement-safe: a duplicate
+ * dedup_key within one batch is skipped, not an error.)
+ */
+export async function enqueueMany(rows: NewNotification[]): Promise<number> {
+  if (rows.length === 0) return 0;
+  const now = nowIso();
+  return withTransaction(async () => {
+    let inserted = 0;
+    for (let at = 0; at < rows.length; at += ENQUEUE_CHUNK) {
+      const chunk = rows.slice(at, at + ENQUEUE_CHUNK);
+      const params: unknown[] = [];
+      const tuples = chunk.map((n) => {
+        const base = params.length;
+        params.push(...insertParams(n, now));
+        return valuesTuple(base);
+      });
+      inserted += await run(`${INSERT_HEAD} ${tuples.join(', ')} ${ON_CONFLICT}`, params);
+    }
+    return inserted;
+  });
 }
-
-const claimStmt = db.prepare(`
-  SELECT * FROM notifications
-  WHERE status = 'queued' AND next_attempt_at <= @now
-  ORDER BY id
-  LIMIT @limit
-`);
 
 /** Queued notifications whose backoff has elapsed (oldest first), for delivery. */
-export function claimDue(now: string, limit: number): NotificationRow[] {
-  return claimStmt.all({ now, limit }) as NotificationRow[];
+export function claimDue(now: string, limit: number): Promise<NotificationRow[]> {
+  return many<NotificationRow>(
+    `SELECT * FROM notifications WHERE status = 'queued' AND next_attempt_at <= $1 ORDER BY id LIMIT $2`,
+    [now, limit],
+  );
 }
 
-const stillQueuedStmt = db.prepare(`SELECT 1 FROM notifications WHERE id = ? AND status = 'queued'`);
 /**
  * True while a claimed row still exists and is still 'queued'. The worker holds
  * claimed rows in memory across paced sends, and erasure (deleteForContributor)
  * may delete them meanwhile — this is the last-moment check that keeps a purged
  * row from being delivered anyway.
  */
-export function isStillQueued(id: number): boolean {
-  return stillQueuedStmt.get(id) !== undefined;
+export async function isStillQueued(id: number): Promise<boolean> {
+  return (await one(`SELECT 1 AS ok FROM notifications WHERE id = $1 AND status = 'queued'`, [id])) !== undefined;
 }
 
-const markSentStmt = db.prepare(
-  `UPDATE notifications SET status = 'sent', attempts = attempts + 1, last_error = NULL, updated_at = @now WHERE id = @id`,
-);
-export function markSent(id: number): void {
-  markSentStmt.run({ id, now: nowIso() });
+export async function markSent(id: number): Promise<void> {
+  await run(`UPDATE notifications SET status = 'sent', attempts = attempts + 1, last_error = NULL, updated_at = $1 WHERE id = $2`, [
+    nowIso(),
+    id,
+  ]);
 }
 
-const markRetryStmt = db.prepare(
-  `UPDATE notifications SET attempts = attempts + 1, last_error = @error, next_attempt_at = @next, updated_at = @now WHERE id = @id`,
-);
 /** Keep the row queued for a later retry after a delivery error (attempts is bumped). */
-export function markRetry(id: number, error: string, nextAttemptAt: string): void {
-  markRetryStmt.run({ id, error, next: nextAttemptAt, now: nowIso() });
+export async function markRetry(id: number, error: string, nextAttemptAt: string): Promise<void> {
+  await run('UPDATE notifications SET attempts = attempts + 1, last_error = $1, next_attempt_at = $2, updated_at = $3 WHERE id = $4', [
+    error,
+    nextAttemptAt,
+    nowIso(),
+    id,
+  ]);
 }
 
-const markFailedStmt = db.prepare(
-  `UPDATE notifications SET status = 'failed', attempts = attempts + 1, last_error = @error, updated_at = @now WHERE id = @id`,
-);
+/**
+ * Push every still-queued row for a chat that sits after `afterId` out to at least
+ * `nextAttemptAt`. When a row is deferred by a retry, its later same-chat siblings
+ * must not become due before it — else claimDue (ordered by id, filtered by
+ * next_attempt_at) would deliver a later message ahead of the earlier retried one,
+ * breaking in-order delivery per recipient. GREATEST leaves a row already scheduled
+ * further out untouched.
+ */
+export async function deferChatRowsAfter(chatId: string, afterId: number, nextAttemptAt: string): Promise<number> {
+  return run(
+    `UPDATE notifications SET next_attempt_at = GREATEST(next_attempt_at, $1::timestamptz), updated_at = $2
+     WHERE chat_id = $3 AND status = 'queued' AND id > $4`,
+    [nextAttemptAt, nowIso(), chatId, afterId],
+  );
+}
+
 /** Give up after the retry budget is exhausted. */
-export function markFailed(id: number, error: string): void {
-  markFailedStmt.run({ id, error, now: nowIso() });
+export async function markFailed(id: number, error: string): Promise<void> {
+  await run(`UPDATE notifications SET status = 'failed', attempts = attempts + 1, last_error = $1, updated_at = $2 WHERE id = $3`, [
+    error,
+    nowIso(),
+    id,
+  ]);
 }
-
-const countsStmt = db.prepare(`
-  SELECT
-    COALESCE(SUM(status = 'queued' AND attempts = 0), 0) AS queued,
-    COALESCE(SUM(status = 'queued' AND attempts > 0), 0) AS retrying,
-    COALESCE(SUM(status = 'sent'), 0)                    AS sent,
-    COALESCE(SUM(status = 'failed'), 0)                  AS failed
-  FROM notifications
-`);
 
 export interface NotificationCounts {
   queued: number;
@@ -155,37 +188,37 @@ export interface NotificationCounts {
 }
 
 /** Delivery-status tallies for observability (queued / retrying / sent / failed). */
-export function statusCounts(): NotificationCounts {
-  return countsStmt.get() as NotificationCounts;
+export async function statusCounts(): Promise<NotificationCounts> {
+  return (await one<NotificationCounts>(`
+    SELECT
+      COUNT(*) FILTER (WHERE status = 'queued' AND attempts = 0) AS queued,
+      COUNT(*) FILTER (WHERE status = 'queued' AND attempts > 0) AS retrying,
+      COUNT(*) FILTER (WHERE status = 'sent')                    AS sent,
+      COUNT(*) FILTER (WHERE status = 'failed')                  AS failed
+    FROM notifications
+  `))!;
 }
 
-const byDedupStmt = db.prepare('SELECT * FROM notifications WHERE dedup_key = ?');
 /** Look a notification up by its idempotency key (used by tests/introspection). */
-export function findByDedup(dedupKey: string): NotificationRow | undefined {
-  return byDedupStmt.get(dedupKey) as NotificationRow | undefined;
+export function findByDedup(dedupKey: string): Promise<NotificationRow | undefined> {
+  return one<NotificationRow>('SELECT * FROM notifications WHERE dedup_key = $1', [dedupKey]);
 }
 
-const pruneFinishedStmt = db.prepare(
-  `DELETE FROM notifications WHERE status IN ('sent', 'failed') AND updated_at < ?`,
-);
 /**
  * Ops hygiene: drop sent/failed rows older than the cutoff so the table doesn't
  * grow forever (rendered text is also PII surface area — see subject_id).
  * Queued rows are never pruned. Dedup safety holds: keys are event-scoped and
  * the workflow guards prevent an old event from re-firing after its row is gone.
  */
-export function pruneFinished(beforeIso: string): number {
-  return pruneFinishedStmt.run(beforeIso).changes;
+export async function pruneFinished(beforeIso: string): Promise<number> {
+  return run(`DELETE FROM notifications WHERE status IN ('sent', 'failed') AND updated_at < $1`, [beforeIso]);
 }
 
-const deleteForContributorStmt = db.prepare(
-  'DELETE FROM notifications WHERE chat_id = @chat OR subject_id = @id',
-);
 /**
  * Used by erasure: drop every notification addressed to the contributor (their
  * chat) or about them (subject_id) — regardless of delivery status, since sent
  * rows retain the rendered text (pitches, names, work) and their chat id.
  */
-export function deleteForContributor(telegramId: number): number {
-  return deleteForContributorStmt.run({ chat: String(telegramId), id: telegramId }).changes;
+export async function deleteForContributor(telegramId: number): Promise<number> {
+  return run('DELETE FROM notifications WHERE chat_id = $1 OR subject_id = $2', [String(telegramId), telegramId]);
 }

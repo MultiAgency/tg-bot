@@ -12,6 +12,23 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Real Postgres, matching production. The demos reset a scratch schema per run.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: multiagency
+          POSTGRES_PASSWORD: multiagency
+          POSTGRES_DB: multiagency_test
+        ports:
+          - 5455:5432
+        options: >-
+          --health-cmd "pg_isready -U multiagency -d multiagency_test"
+          --health-interval 2s --health-timeout 3s --health-retries 20
+    env:
+      # The demo scripts read TEST_DATABASE_URL (never the dev DATABASE_URL) so
+      # their DROP SCHEMA reset can only ever hit this throwaway CI database.
+      TEST_DATABASE_URL: postgresql://multiagency:multiagency@localhost:5455/multiagency_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,10 +36,11 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
       - run: npm ci
-      # Full gate: typecheck, build, then all four demo suites (core-demo,
-      # demo, queue-demo, edge-demo) — service-layer edge cases, the end-to-end
-      # bot loop, queue delivery semantics, and the adversarial edges (Telegram
-      # size limits, group privacy, erasure races, backups). Each drives real
-      # code with a stubbed network and a throwaway database; the npm scripts
-      # set their own dummy env, so no real token or AI key is needed.
+      # Full gate: typecheck, build, then all five demo suites (core-demo, demo,
+      # queue-demo, edge-demo, rooms-demo) — service-layer edge cases, the
+      # end-to-end bot loop, queue delivery semantics, adversarial edges (Telegram
+      # size limits, group privacy, erasure races), and rooms/signal detection.
+      # Each drives real code against the Postgres service above, with a stubbed
+      # network and a per-run scratch schema; the npm scripts set their own dummy
+      # env, so no real token or AI key is needed.
       - run: npm test

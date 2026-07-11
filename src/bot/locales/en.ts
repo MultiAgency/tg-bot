@@ -43,7 +43,7 @@ export const en = {
     `This step only works in a private chat — group chats don’t deliver regular messages to the bot. ${dmMe(p.username)}`,
 
   // ---- help ----
-  'help.text': (p: { admin: boolean; ai: boolean }): string => {
+  'help.text': (p: { admin: boolean; roomAdmin: boolean; ai: boolean }): string => {
     const contributor = [
       '👋 MultiAgency contributor bot',
       '',
@@ -56,11 +56,12 @@ export const en = {
       '/status <taskId> — a task and its history',
       '/privacy — what this bot stores about you',
     ];
-    const admin = [
+    // Room admins get the task-management commands, scoped to their rooms' tasks.
+    const managerScope = p.admin ? '' : ' (your rooms’ tasks)';
+    const manager = [
       '',
-      'Admin commands:',
-      '/admin — overview: what needs you, and where',
-      '/newtask — create a task (set max assignees)',
+      p.admin ? 'Admin commands:' : `Room-admin commands${managerScope}:`,
+      ...(p.admin ? ['/admin — overview: what needs you, and where', '/newtask — create a task (set max assignees)'] : []),
       '/approve — approve draft tasks',
       '/applicants <taskId> — review applicants; assign or decline',
       '/active — assignments in progress',
@@ -68,10 +69,12 @@ export const en = {
       '/close <taskId> — stop accepting applications',
       '/reopen <taskId> — reopen for applications',
       '/unassign <applicationId> — remove an assignment (records a reason)',
-      '/forget <contributorId> — erase a contributor’s data',
+      ...(p.admin ? ['/forget <contributorId> — erase a contributor’s data'] : []),
+      '',
+      'In a group the bot is in: /enablesignals, /disablesignals, /signalstatus (AI task drafts from chat), and /addroomadmin, /removeroomadmin, /roomadmins (reply to a message to pick the person).',
     ];
     const footer = ['', '/cancel — abort the current step', p.ai ? '🤖 AI drafting is enabled.' : ''];
-    return [...contributor, ...(p.admin ? admin : []), ...footer].join('\n');
+    return [...contributor, ...(p.admin || p.roomAdmin ? manager : []), ...footer].join('\n');
   },
 
   // ---- task creation & approval ----
@@ -104,7 +107,6 @@ export const en = {
 
   // ---- applicants ----
   'applicants.usage': 'Usage: /applicants <taskId>',
-  'applicants.notFound': (p: { id: number }) => `Task #${p.id} not found.`,
   'applicants.header': (p: { id: number; title: string; assigned: number; max: number; n: number }) =>
     `👥 Task #${p.id} "${p.title}" — ${p.assigned}/${p.max} assigned, ${p.n} awaiting decision:`,
 
@@ -137,14 +139,17 @@ export const en = {
   'forget.fail': 'Could not erase the contributor.',
 
   // ---- privacy ----
-  'privacy.text': (p: { ai: boolean }) =>
+  'privacy.text': (p: { ai: boolean; notifRetentionDays: number }) =>
     [
       '🔐 What this bot stores about you',
       '',
       'When you use the bot: your Telegram id, username, display name, and language; your applications and pitches; the work you submit; and each task’s action history. People who only read or chat in a group with the bot are not recorded.',
-      'Delivery records for notifications are kept for 30 days, then deleted. Database backups rotate within 7 days.',
+      `Delivery records for notifications are kept for ${p.notifRetentionDays} days, then deleted. Data you erase is removed from the live database immediately; copies in infrastructure backups age out automatically as those backups expire under the configured retention window.`,
       ...(p.ai
-        ? ['When AI assistance is enabled, submitted text and task briefs are processed by NEAR AI Cloud to draft summaries for reviewers.']
+        ? [
+            'When AI assistance is enabled, submitted text and task briefs are processed by NEAR AI Cloud to draft summaries for reviewers.',
+            'In groups where this room’s admins turned signal detection ON (announced in the group; /signalstatus shows it), messages are also processed by NEAR AI Cloud to suggest task drafts. The messages themselves and their authors are never stored — only an anonymous score record.',
+          ]
         : []),
       '',
       'To have everything about you erased, ask any admin — erasure deletes your profile, applications, and submissions, anonymizes history, and purges notification records about you, queued or already delivered.',
@@ -266,7 +271,44 @@ export const en = {
   'un.done': '➖ Unassigned. The slot is free and the contributor is back in the applicant pool.',
   'un.fail': 'Could not unassign.',
 
+  // ---- rooms (group chats) & room admins ----
+  'rooms.groupOnly': 'This command works inside a group the bot is in — not here.',
+  'rooms.roomAdminsOnly': 'Only this room’s admins (or global admins) can do that.',
+  'rooms.replyToAdd': 'Reply to a message from the person you want to promote, then send /addroomadmin.',
+  'rooms.replyToRemove': 'Reply to a message from the room admin you want to remove, then send /removeroomadmin.',
+  'rooms.botCannotBeAdmin': 'A bot cannot be a room admin.',
+  'rooms.adminAdded': (p: { name: string }) =>
+    `🛡 ${p.name} is now a room admin for this group — they can manage this room’s tasks via a DM with the bot. (If they haven’t started the bot yet, they should DM it /help first.)`,
+  'rooms.alreadyAdmin': (p: { name: string }) => `${p.name} is already a room admin here.`,
+  'rooms.adminRemoved': (p: { name: string }) => `➖ ${p.name} is no longer a room admin for this group.`,
+  'rooms.notAdmin': (p: { name: string }) => `${p.name} is not a room admin here.`,
+  'rooms.adminList': (p: { lines: string }) => `🛡 Room admins for this group:\n${p.lines}`,
+  'rooms.noAdmins':
+    'No room admins yet. Reply to a user’s message with /addroomadmin to add one (global admins can bootstrap).',
+
+  // ---- signal detection ----
+  'signals.needsAi': 'Signal detection needs AI assistance, which is not enabled on this bot.',
+  'signals.enabled':
+    '🔎 Signal detection is ON for this group: messages here are scored by AI (NEAR AI Cloud) to suggest task drafts, which admins review before anything opens. Messages and their authors are not stored. /disablesignals turns it off; /signalstatus shows status.',
+  'signals.disabled': '🔕 Signal detection is OFF for this group.',
+  'signals.status': (p: { on: boolean; drafted: number; discarded: number }) =>
+    p.on
+      ? `🔎 Signal detection is ON for this group (so far: ${p.drafted} drafted, ${p.discarded} discarded). Messages are AI-scored to suggest task drafts; messages and authors are not stored. /disablesignals turns it off.`
+      : `🔕 Signal detection is OFF for this group. A room admin can turn it on with /enablesignals.`,
+
+  // ---- shared manageability errors (room-aware admin commands) ----
+  'task.notManageable': (p: { id: number }) => `Task #${p.id} not found (or not yours to manage).`,
+  'app.notManageable': (p: { id: number }) => `Application #${p.id} not found (or not yours to manage).`,
+
   // ---- notifications ----
+  'notify.signalDraft': (p: { line: string; room: string | null }) =>
+    `🔎 Signal detection drafted a task from${p.room ? ` "${p.room}"` : ' a group'}:\n${p.line}\n\nReview it with /approve (or leave it as a draft).`,
+  'notify.roomRegistered': (p: { title: string | null; chatId: number; inviterId: number | null }) =>
+    `👥 The bot was added to the group ${p.title ? `"${p.title}"` : String(p.chatId)}${
+      p.inviterId !== null ? ` by user ${p.inviterId}, who is now that room’s first admin` : ''
+    }.\nA room admin can enable AI task drafts there with /enablesignals, and add more room admins with /addroomadmin (as a reply to their message).`,
+  'notify.roomAdminPromoted': (p: { title: string | null }) =>
+    `🛡 You’re now a room admin${p.title ? ` for "${p.title}"` : ''}. You can approve, assign, and review that room’s tasks — send /help to see your commands.`,
   'notify.reviewHeader': (p: { card: string }) => `📬 New submission for review\n\n${p.card}`,
   'notify.reviewAiNote': (p: { taskId: number; version: number; note: string }) =>
     `🤖 AI note on submission v${p.version} for task #${p.taskId}:\n${p.note}`,
@@ -291,8 +333,6 @@ export const en = {
   'notify.applicationHeaderId': (p: { id: number }) => `🙋 New application for task #${p.id}`,
   'notify.submissionCaption': (p: { version: number; caption: string }) =>
     `Submission v${p.version}${p.caption ? ` — ${p.caption}` : ''}`,
-  'notify.backupFailed': (p: { error: string }) =>
-    `⚠️ Daily database backup failed: ${p.error}\nCheck the service logs and volume (disk space is the usual cause). Backups are the corruption safety net — investigate before it matters.`,
 
   // NOTE: the card field-labels in src/bot/format.ts intentionally do NOT route
   // through this catalog yet (see README "Internationalization") — add their

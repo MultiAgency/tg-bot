@@ -21,7 +21,7 @@ export const applyScene = new Scenes.WizardScene<BotContext>(
     const L = localeOf(ctx);
     if (!(await requirePrivateChat(ctx))) return ctx.scene.leave();
     const taskId = wizardState(ctx).taskId;
-    const task = taskId ? getTask(taskId) : undefined;
+    const task = taskId ? await getTask(taskId) : undefined;
     if (!task || task.status !== TaskStatus.Open) {
       await ctx.reply(t(L, 'apply.notOpen'));
       return ctx.scene.leave();
@@ -30,7 +30,7 @@ export const applyScene = new Scenes.WizardScene<BotContext>(
     // channel deep-link path lands here directly, and its button outlives the
     // task filling up — don't collect a pitch that service.apply must refuse.
     // (service.apply re-checks inside the transaction; this is the UX gate.)
-    if (countSlotsTaken(task.id) >= task.max_assignees) {
+    if ((await countSlotsTaken(task.id)) >= task.max_assignees) {
       await ctx.reply(t(L, 'apply.full', { id: task.id }));
       return ctx.scene.leave();
     }
@@ -54,12 +54,12 @@ export const applyScene = new Scenes.WizardScene<BotContext>(
     // notify/reply below must surface in bot.catch, not as a false "failed".
     let app;
     try {
-      app = apply(taskId, ctx.from!.id, pitch);
+      app = await apply(taskId, ctx.from!.id, pitch);
     } catch (err) {
       await ctx.reply(errorMessage(err, t(L, 'apply.fail')));
       return ctx.scene.leave();
     }
-    notifyAdminsOfApplication(app, getTask(taskId)); // durable before any send can fail
+    await notifyAdminsOfApplication(app, await getTask(taskId)); // durable before any send can fail
     await ctx.reply(t(L, 'apply.applied', { id: taskId }));
     return ctx.scene.leave();
   },

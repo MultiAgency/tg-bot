@@ -18,6 +18,7 @@ import {
 import { ApplicationStatus, SubmissionStatus } from '../../core/workflow.js';
 import type { SubmissionType } from '../../core/models/submission.js';
 import { notifyReviewers, notifyReviewerNote } from '../notify.js';
+import { runDetached } from '../background.js';
 import { truncate } from '../format.js';
 import { t, localeOf } from '../i18n.js';
 
@@ -44,6 +45,13 @@ function extractSubmission(ctx: BotContext): Extracted | null {
   if ('video' in msg && msg.video) {
     return { type: 'video', content: msg.video.file_id, caption: msg.caption?.trim() || null };
   }
+  // The in-chat camera button records a round video note (msg.video_note) —
+  // the most discoverable way to send video, and the prompt says "a video";
+  // refusing it would loop the user on guidance they just followed. Video
+  // notes carry no caption in the Bot API.
+  if ('video_note' in msg && msg.video_note) {
+    return { type: 'video_note', content: msg.video_note.file_id, caption: null };
+  }
   if ('text' in msg && typeof msg.text === 'string') {
     const t = msg.text.trim();
     if (!t) return null;
@@ -61,7 +69,7 @@ export const submitScene = new Scenes.WizardScene<BotContext>(
     if (!(await requirePrivateChat(ctx))) return ctx.scene.leave();
     const applicationId = wizardState(ctx).applicationId;
     const uid = ctx.from!.id;
-    const app = applicationId ? getApplication(applicationId) : undefined;
+    const app = applicationId ? await getApplication(applicationId) : undefined;
 
     if (!app || app.contributor_id !== uid) {
       await ctx.reply(t(L, 'sub.notYours'));
@@ -75,7 +83,7 @@ export const submitScene = new Scenes.WizardScene<BotContext>(
       await ctx.reply(t(L, 'sub.notAssigned'));
       return ctx.scene.leave();
     }
-    const latest = latestSubmission(app.id);
+    const latest = await latestSubmission(app.id);
     if (latest && latest.status === SubmissionStatus.Submitted) {
       await ctx.reply(t(L, 'sub.awaitingReview'));
       return ctx.scene.leave();
@@ -84,7 +92,7 @@ export const submitScene = new Scenes.WizardScene<BotContext>(
     // application to Completed/Rejected atomically, so the status checks
     // above already cover both.
 
-    const task = getTask(app.task_id);
+    const task = await getTask(app.task_id);
     // Truncated: a raw near-4096-char title would make this reply throw, and a
     // scene whose step-0 prompt never sends leaves the user trapped in the wizard.
     await ctx.reply(t(L, 'sub.prompt', { id: app.task_id, title: task ? truncate(task.title, 200) : '' }));
@@ -121,17 +129,17 @@ export const submitScene = new Scenes.WizardScene<BotContext>(
     // notify/reply below must surface in bot.catch, not as a false "failed".
     let sub;
     try {
-      sub = submitWork(applicationId, uid, extracted.type, extracted.content, extracted.caption);
+      sub = await submitWork(applicationId, uid, extracted.type, extracted.content, extracted.caption);
     } catch (err) {
       await ctx.reply(errorMessage(err, t(L, 'sub.fail')));
       return ctx.scene.leave();
     }
-    const app = getApplication(applicationId)!;
-    const task = getTask(app.task_id);
+    const app = (await getApplication(applicationId))!;
+    const task = await getTask(app.task_id);
     // The durable reviewer alert is enqueued before anything can fail or
     // wait: "Reviewers will be notified" below must already be true when the
     // contributor reads it.
-    notifyReviewers(sub, app, task);
+    await notifyReviewers(sub, app, task);
     await ctx.reply(t(L, 'sub.ok', { version: sub.version, taskId: app.task_id }));
     const aiText =
       extracted.type === 'text' || extracted.type === 'link' ? extracted.content : extracted.caption;
@@ -139,12 +147,13 @@ export const submitScene = new Scenes.WizardScene<BotContext>(
       // Optional enrichment, detached: it must never hold this user's
       // serialized update queue for the model's 30s timeout, and a crash here
       // only loses the note — the alert above is already queued. reviewNote
-      // never rejects (it degrades to null); the catch covers enqueue errors.
+      // never rejects (it degrades to null). Tracked via runDetached so shutdown
+      // drains the note's enqueue transaction before the pool closes.
       const submission = sub;
-      void ai
-        .reviewNote(task, aiText)
-        .then((note) => (note ? notifyReviewerNote(submission, app, note) : undefined))
-        .catch((err) => console.error('[submit] AI note enqueue failed:', err));
+      runDetached('submit-ai-note', async (signal) => {
+        const note = await ai.reviewNote(task, aiText, signal);
+        if (note) await notifyReviewerNote(submission, app, task, note);
+      });
     }
     return ctx.scene.leave();
   },

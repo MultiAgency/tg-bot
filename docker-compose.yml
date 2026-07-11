@@ -1,0 +1,23 @@
+# Local Postgres for development and the test gate. Mirrors the CI `services:
+# postgres` and Railway Postgres. Port 5455 avoids clashing with a local 5432.
+# Creates two databases: `multiagency` for dev, and `multiagency_test` (via the
+# init script) for the demo/test gate — which DROP SCHEMAs on every run, so it
+# must never touch your dev data.
+#   docker compose up -d
+#   export DATABASE_URL=postgresql://multiagency:multiagency@localhost:5455/multiagency
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: multiagency
+      POSTGRES_PASSWORD: multiagency
+      POSTGRES_DB: multiagency
+    volumes:
+      - ./db/docker-init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - '5455:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U multiagency -d multiagency']
+      interval: 2s
+      timeout: 3s
+      retries: 30

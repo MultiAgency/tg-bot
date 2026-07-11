@@ -1,5 +1,5 @@
 import type { BotContext } from './context.js';
-import { getContributor } from '../core/service.js';
+import { getContributor, listContributorLanguageCodes } from '../core/service.js';
 import { en } from './locales/en.js';
 
 /**
@@ -30,8 +30,22 @@ export function localeOf(ctx: BotContext): string {
 }
 
 /** The stored locale for any contributor (used for notifications we push to them). */
-export function contributorLocale(contributorId: number): string {
-  return baseCode(getContributor(contributorId)?.language_code);
+export async function contributorLocale(contributorId: number): Promise<string> {
+  return baseCode((await getContributor(contributorId))?.language_code);
+}
+
+/**
+ * Stored locales for a whole recipient set in one query — the fan-out variant
+ * of contributorLocale (a per-recipient lookup would cost N serial round trips
+ * inside every manager fan-out). Ids without a contributor row map to the
+ * default locale.
+ */
+export async function contributorLocales(contributorIds: number[]): Promise<Map<number, string>> {
+  const locales = new Map(contributorIds.map((id) => [id, baseCode(null)]));
+  for (const row of await listContributorLanguageCodes(contributorIds)) {
+    locales.set(row.telegram_id, baseCode(row.language_code));
+  }
+  return locales;
 }
 
 /**

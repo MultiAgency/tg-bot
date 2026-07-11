@@ -9,6 +9,7 @@ import {
   requirePrivateChat,
 } from '../context.js';
 import * as ai from '../../ai/assist.js';
+import { shutdownSignal } from '../background.js';
 import { createTask } from '../../core/service.js';
 import { MAX_ASSIGNEES, isValidMaxAssignees } from '../../core/workflow.js';
 import { taskDetail } from '../format.js';
@@ -76,7 +77,7 @@ export const newTaskScene = new Scenes.WizardScene<BotContext>(
     }
     const st = wizardState(ctx);
     if (isCommand(text, 'ai')) {
-      const draft = await aiDraft(ctx, () => ai.suggestTaskDescription(st.title!), {
+      const draft = await aiDraft(ctx, () => ai.suggestTaskDescription(st.title!, shutdownSignal), {
         working: t(L, 'ai.draftDescriptionWorking'),
         disabled: t(L, 'ai.disabledDescription'),
         unavailable: t(L, 'ai.draftUnavailableDescription'),
@@ -127,7 +128,7 @@ export const newTaskScene = new Scenes.WizardScene<BotContext>(
     }
     const st = wizardState(ctx);
     if (isCommand(text, 'ai')) {
-      const draft = await aiDraft(ctx, () => ai.suggestRequiredOutput(st.title!, st.description!), {
+      const draft = await aiDraft(ctx, () => ai.suggestRequiredOutput(st.title!, st.description!, shutdownSignal), {
         working: t(L, 'ai.draftOutputWorking'),
         disabled: t(L, 'ai.disabledOutput'),
         unavailable: t(L, 'ai.draftUnavailableOutput'),
@@ -160,7 +161,7 @@ export const newTaskScene = new Scenes.WizardScene<BotContext>(
       st.maxAssignees = n;
     }
 
-    const task = createTask({
+    const task = await createTask({
       title: st.title!,
       description: st.description!,
       reward: st.reward ?? null,
