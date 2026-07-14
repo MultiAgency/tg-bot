@@ -1,15 +1,18 @@
 import { config } from '../config.js';
 import * as ai from '../ai/assist.js';
 import { claimSignalSlot, discardSignal, draftTaskFromSignal, getRoom } from '../core/service.js';
+import { roomContext, recordMessage } from './roomContext.js';
 import { notifySignalDraft } from './notify.js';
 
 /**
  * Signal detection: group-chat messages in rooms that opted in (/enablesignals)
  * are scored by AI, and promising ones become DRAFT tasks for human approval.
- * Privacy invariants (see /privacy and SCOPE.md): the message text goes to the
- * model and is then dropped — never stored — and neither is the author's id; a
- * signal row records only room, score, and outcome. AI stays advisory: the
- * strongest signal only ever creates a Draft — a human approves it (or not).
+ * Privacy invariants (see /privacy and SCOPE.md): message text is never written
+ * to storage — it goes to the model and, for a short window, sits in the RAM-only
+ * room-context buffer (roomContext.ts) before being evicted; the author's id is
+ * never recorded at all. A signal row holds only room, score, and outcome. AI
+ * stays advisory: the strongest signal only ever creates a Draft — a human
+ * approves it (or not).
  */
 
 // Cheap heuristics to skip obvious noise before spending a rate-limit slot
@@ -39,13 +42,30 @@ export async function handleGroupMessage(chatId: number, text: string, signal?: 
   if (!ai.aiEnabled() || !passesPreFilter(text)) return;
   const room = await getRoom(chatId);
   if (!room || !room.signals_enabled) return;
+  // The RAM context window is consent-gated on the SAME signals_enabled flag the
+  // group-visible /enablesignals notice announced: chatter from a room that
+  // never opted in (or only enabled AI mode, whose notice promises other
+  // chatter stays untouched) must not linger even in memory — otherwise a later
+  // opt-in would ship pre-consent messages to the model as context. Snapshot
+  // the prior window BEFORE recording, so the context is what surrounded the
+  // message, not the message itself. (Only prefilter-passing text is recorded:
+  // consent-checking one-word interjections too would cost a DB read on every
+  // group message the bot can see.)
+  const context = roomContext(chatId);
+  recordMessage(chatId, text);
   const signalId = await claimSignalSlot(chatId, config.signalMaxPerHour);
   if (signalId === null) return; // hourly AI budget for this room is spent
-  await evaluate(signalId, chatId, text, signal);
+  await evaluate(signalId, chatId, text, context, signal);
 }
 
-async function evaluate(signalId: number, chatId: number, text: string, signal?: AbortSignal): Promise<void> {
-  const evaluation = await ai.evaluateSignal(text, signal);
+async function evaluate(
+  signalId: number,
+  chatId: number,
+  text: string,
+  context: string[],
+  signal?: AbortSignal,
+): Promise<void> {
+  const evaluation = await ai.evaluateSignal(text, context, signal);
   if (
     !evaluation ||
     !evaluation.shouldDraft ||
@@ -61,7 +81,13 @@ async function evaluate(signalId: number, chatId: number, text: string, signal?:
   const { task, roomTitle } = await draftTaskFromSignal(
     signalId,
     chatId,
-    { title: evaluation.title, description: evaluation.description, requiredOutput: evaluation.requiredOutput },
+    {
+      title: evaluation.title,
+      description: evaluation.description,
+      requiredOutput: evaluation.requiredOutput,
+      deadline: evaluation.deadline,
+      maxAssignees: evaluation.maxAssignees,
+    },
     evaluation.score,
   );
   console.log(`[signals] drafted task #${task.id} from a signal in room ${chatId} (score ${evaluation.score})`);

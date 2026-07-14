@@ -128,6 +128,10 @@ async function main(): Promise<void> {
       title: 'Translate the docs to Spanish',
       description: 'Community needs the onboarding docs in Spanish before the meetup.',
       requiredOutput: 'A PR with the translated docs',
+      deadline: 'Fri 18:00 UTC',
+      // Out of range on purpose: exercises the 1–20 slot clamp in
+      // parseSignalEvaluation — it must land as 20, never the raw 99.
+      maxAssignees: 99,
     });
   mark = outbound.length;
   await inGroup(OMAR, 'we really need someone to translate the onboarding docs to Spanish before the meetup next week');
@@ -144,6 +148,9 @@ async function main(): Promise<void> {
   assert.equal(drafted.room_chat_id, ROOM, 'task belongs to the room');
   assert.equal(drafted.created_by, null, 'no author recorded on the task');
   assert.equal(drafted.title, 'Translate the docs to Spanish');
+  assert.equal(drafted.deadline, 'Fri 18:00 UTC', 'AI-suggested deadline flows onto the task');
+  assert.equal(drafted.max_assignees, 20, 'out-of-range slots clamped to 20, never stored raw');
+  assert.equal(drafted.reward, null, 'AI suggests no reward — a human sets it at approval');
   const created = (await listHistory(1)).find((e) => e.action === 'created')!;
   assert.equal(created.actor_id, null, 'history names no actor');
   assert.ok(created.detail!.includes('score 8'), 'history carries the score, nothing personal');
@@ -161,7 +168,8 @@ async function main(): Promise<void> {
   step('4. Privacy invariants: no message text, no author, no bystander profiles');
   const signalCols = (
     await many<{ column_name: string }>(
-      "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'signals'",
+      'SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1',
+      ['signals'],
     )
   )
     .map((c) => c.column_name)
@@ -216,6 +224,14 @@ async function main(): Promise<void> {
   assert.ok(repliesTo(mark, MAYA).some((o) => o.text.includes('Translate the docs')), 'room admin sees her room’s draft');
   await tap(MAYA, 'approve:1');
   assert.equal((await getTask(1))!.status, 'open', 'room admin approved → open');
+  // The room-scoped task announces back INTO the room on approval, so the
+  // community whose chatter drafted it actually sees the opening.
+  mark = outbound.length;
+  await drainNotifications(bot.telegram);
+  assert.ok(
+    repliesTo(mark, ROOM).some((o) => o.text.includes('task from this group is now open') && o.text.includes('Translate the docs')),
+    'approved room task is announced into its room',
+  );
 
   await say(PETE, '/open');
   await tap(PETE, 'apply:1');
@@ -350,6 +366,62 @@ async function main(): Promise<void> {
     'an id matching nothing still fails loudly',
   );
   ok('profile-less room admin erasable; typo’d ids still refused');
+
+  // -------------------------------------------------------------------------
+  step('12. AI mode: the agent answers when addressed, ignores ambient chatter');
+  mark = outbound.length;
+  await inGroup(ADMIN, '/ai on');
+  assert.ok(repliesTo(mark, ROOM).some((o) => o.text.includes('AI mode is ON')), '/ai on confirmed in the group');
+  assert.equal((await getRoom(ROOM))!.ai_enabled, 1, 'ai_enabled persisted');
+  // Addressed (an @mention of the bot) → the agent answers. The stub returns a
+  // plain assistant message (no tool_calls), so the loop replies in one round.
+  aiResponder.current = () => 'There is one open task right now. Want to apply?';
+  mark = outbound.length;
+  await inGroup(OMAR, '@DemoBot what can I help with around here?');
+  await waitFor(
+    async () => repliesTo(mark, ROOM).some((o) => o.text.includes('one open task')),
+    'the agent answered when addressed',
+  );
+  // Un-addressed ambient chatter → the agent never fires (it would only feed
+  // signal detection, off here), so the model is not called.
+  const callsBefore = aiCalls;
+  await inGroup(OMAR, 'anyway that lunch place downtown was great yesterday');
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(aiCalls, callsBefore, 'un-addressed chatter never reaches the agent');
+  mark = outbound.length;
+  await inGroup(ADMIN, '/ai off');
+  assert.ok(repliesTo(mark, ROOM).some((o) => o.text.includes('AI mode is OFF')), '/ai off confirmed');
+  assert.equal((await getRoom(ROOM))!.ai_enabled, 0, 'ai_enabled cleared');
+  ok('agent answers when addressed, ignores ambient chatter; toggle persists');
+
+  // -------------------------------------------------------------------------
+  step('13. /settings panel: room toggles are tap-gated; DM panel toggles the opt-in');
+  mark = outbound.length;
+  await inGroup(MAYA, '/settings');
+  const panel = repliesTo(mark, ROOM).find((o) => o.text.includes('Group settings'));
+  const panelWired = JSON.stringify(panel?.replyMarkup ?? {});
+  assert.ok(panel && panelWired.includes('set:ai:') && panelWired.includes('set:sig:'), 'group panel shows signal + AI toggles');
+  // A non-admin tap is refused with an alert and changes nothing (panel is public, action is gated).
+  mark = outbound.length;
+  await tap(OMAR, 'set:ai:on', groupChat);
+  assert.ok(since(mark).some((o) => o.method === 'answerCallbackQuery' && o.text.includes('admins')), 'non-admin toggle refused with an alert');
+  assert.equal((await getRoom(ROOM))!.ai_enabled, 0, 'non-admin tap changed nothing');
+  // A manager tap (the global admin here — Maya/Omar were both erased earlier)
+  // toggles the flag, posts the group transparency notice, and edits the panel.
+  mark = outbound.length;
+  await tap(ADMIN, 'set:ai:on', groupChat);
+  assert.equal((await getRoom(ROOM))!.ai_enabled, 1, 'manager turned AI mode on via the panel');
+  assert.ok(repliesTo(mark, ROOM).some((o) => o.text.includes('AI mode is ON')), 'group told AI mode is on');
+  assert.ok(since(mark).some((o) => o.method === 'editMessageText'), 'panel re-rendered in place');
+  await tap(ADMIN, 'set:ai:off', groupChat); // restore prior state
+  assert.equal((await getRoom(ROOM))!.ai_enabled, 0, 'toggled back off');
+  // The DM panel exposes the tapper's OWN announcement opt-in — no gate.
+  mark = outbound.length;
+  await say(ADMIN, '/settings');
+  assert.ok(repliesTo(mark, ADMIN).some((o) => o.text.includes('Task-announcement DMs')), 'DM panel shows the notify toggle');
+  await tap(ADMIN, 'set:notify:on');
+  assert.equal((await getContributor(ADMIN))!.announce_opt_in, 1, 'DM toggle set the opt-in');
+  ok('/settings: public panel, tap-gated room toggles, DM opt-in toggle');
 
   // -------------------------------------------------------------------------
   step('Global invariants');

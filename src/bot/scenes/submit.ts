@@ -127,15 +127,14 @@ export const submitScene = new Scenes.WizardScene<BotContext>(
 
     // Only the mutation is inside the try: once it commits, a failure in the
     // notify/reply below must surface in bot.catch, not as a false "failed".
-    let sub;
+    let result;
     try {
-      sub = await submitWork(applicationId, uid, extracted.type, extracted.content, extracted.caption);
+      result = await submitWork(applicationId, uid, extracted.type, extracted.content, extracted.caption);
     } catch (err) {
       await ctx.reply(errorMessage(err, t(L, 'sub.fail')));
       return ctx.scene.leave();
     }
-    const app = (await getApplication(applicationId))!;
-    const task = await getTask(app.task_id);
+    const { submission: sub, application: app, task } = result;
     // The durable reviewer alert is enqueued before anything can fail or
     // wait: "Reviewers will be notified" below must already be true when the
     // contributor reads it.

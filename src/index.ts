@@ -5,6 +5,7 @@ import { initSchema, closePool } from './core/db.js';
 import { reclaimStaleSignals } from './core/service.js';
 import { startWorker, stopWorker } from './bot/worker.js';
 import { drainDetached, beginShutdown } from './bot/background.js';
+import { startWebServer, stopWebServer } from './web/server.js';
 
 async function main(): Promise<void> {
   // Apply pending migrations before anything touches the database.
@@ -36,6 +37,14 @@ async function main(): Promise<void> {
         .catch(menuFail(`admin ${adminId}`)),
     ),
   ]);
+
+  // Point the chat menu button (next to the input field) at the Mini App, when
+  // its public origin is configured. Non-fatal like the command menus.
+  if (config.webAppUrl) {
+    await bot.telegram
+      .setChatMenuButton({ menuButton: { type: 'web_app', text: 'Board', web_app: { url: config.webAppUrl } } })
+      .catch(menuFail('web_app menu button'));
+  }
 
   // launch() resolves only once the bot stops, so start it without awaiting.
   const launched = bot.launch().catch((err) => {
@@ -69,7 +78,10 @@ async function main(): Promise<void> {
     // loss on the next boot). Worker and detached drain in parallel; both are
     // internally bounded so neither pins shutdown past the grace window.
     if (polling) await launched;
-    await Promise.all([stopWorker(), drainDetached()]);
+    // Stop the web server alongside the worker/detached drain — it must stop
+    // accepting requests before closePool(), or an in-flight web read could
+    // query a closed pool.
+    await Promise.all([stopWorker(), drainDetached(), stopWebServer()]);
     await closePool();
     if (!polling) process.exit(0);
   };
@@ -78,6 +90,9 @@ async function main(): Promise<void> {
 
   // Single global notification worker: drains the queue, rate-limited, with retries.
   startWorker(bot.telegram);
+
+  // Mini App web tier, in-process, when a port is configured (off by default).
+  if (config.webPort) startWebServer(config.webPort);
 
   console.log('🤖 MultiAgency bot is running (long polling).');
   console.log(`   Admins: ${config.adminIds.size} · AI assist: ${aiEnabled() ? 'on' : 'off'} · notify: ${config.notifyRatePerSec}/s`);

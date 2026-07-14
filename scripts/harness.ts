@@ -13,13 +13,74 @@ import { Telegram } from 'telegraf';
 export const step = (t: string): void => console.log(`\n▶ ${t}`);
 export const ok = (t: string): void => console.log(`  ✅ ${t}`);
 
+// The subset of HTML tags Telegram accepts in parse_mode:'HTML' (a superset of
+// what the bot emits — b, code, blockquote). Anything else is a 400 in prod.
+const ALLOWED_HTML_TAGS = new Set([
+  'b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'code', 'pre', 'a', 'blockquote', 'tg-spoiler', 'span',
+]);
+
+/**
+ * Validate a string the bot sent with parse_mode:'HTML' the way Telegram's
+ * server would: only allowed tags, properly balanced, and every '<' '>' '&' is
+ * either part of a tag or a well-formed entity. Throws otherwise. The demo
+ * transport calls this so an unescaped title or a dropped closing tag fails a
+ * suite loudly here instead of silently 400ing (or worse, injecting) in prod —
+ * the stub, again, being no laxer than the live API (see file header).
+ */
+export function assertValidHtml(s: string, method: string): void {
+  const stack: string[] = [];
+  for (let i = 0; i < s.length; ) {
+    const ch = s[i];
+    if (ch === '&') {
+      const m = /^&(amp|lt|gt|quot|#\d+|#x[0-9a-fA-F]+);/.exec(s.slice(i));
+      if (!m) throw new Error(`${method}: unescaped '&' near ${JSON.stringify(s.slice(i, i + 24))}`);
+      i += m[0].length;
+    } else if (ch === '>') {
+      throw new Error(`${method}: stray '>' near ${JSON.stringify(s.slice(Math.max(0, i - 12), i + 12))}`);
+    } else if (ch === '<') {
+      const m = /^<(\/?)([a-zA-Z][a-zA-Z-]*)([^>]*)>/.exec(s.slice(i));
+      if (!m) throw new Error(`${method}: unescaped '<' near ${JSON.stringify(s.slice(i, i + 24))}`);
+      const [full, closing, name] = m;
+      const tag = name.toLowerCase();
+      if (!ALLOWED_HTML_TAGS.has(tag)) throw new Error(`${method}: unsupported tag <${closing}${tag}>`);
+      if (closing) {
+        const top = stack.pop();
+        if (top !== tag) throw new Error(`${method}: </${tag}> closes <${top ?? 'nothing'}>`);
+      } else {
+        stack.push(tag);
+      }
+      i += full.length;
+    } else {
+      i += 1;
+    }
+  }
+  if (stack.length) throw new Error(`${method}: unclosed <${stack.join('>, <')}>`);
+}
+
 export interface Outbound {
   method: string;
   chatId: number | string | undefined;
+  /** Human-readable text: HTML tags stripped and entities decoded, so substring
+   *  assertions read what the user sees (`#1`, not `#<code>1</code>`). */
   text: string;
+  /** The raw text/caption as sent, tags and entities intact — for HTML-specific assertions. */
+  html: string;
   fileId?: string;
   /** reply_markup verbatim — lets suites assert button wiring (callback vs URL deep link). */
   replyMarkup?: unknown;
+  /** answerInlineQuery results verbatim — lets suites assert inline-mode search output. */
+  results?: unknown[];
+}
+
+/** Strip HTML tags and decode the entities the bot emits — the user-visible text. */
+function htmlToPlain(s: string): string {
+  return s
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&amp;/g, '&'); // last, so a literal "&amp;amp;" doesn't over-decode
 }
 
 export interface HarnessUser {
@@ -65,16 +126,29 @@ export function createHarness(
         apiErrors.push(`${method}: caption is too long (${caption.length})`);
         throw new Error('400: Bad Request: message caption is too long');
       }
+      if (payload.parse_mode === 'HTML') {
+        try {
+          if (text !== undefined) assertValidHtml(text, method);
+          if (caption !== undefined) assertValidHtml(caption, method);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          apiErrors.push(message);
+          throw new Error(`400: Bad Request: ${message}`);
+        }
+      }
       await onApi.current?.(method, payload);
       const fileId = (payload.photo ?? payload.document ?? payload.video ?? payload.video_note) as
         | string
         | undefined;
+      const raw = text ?? caption ?? '';
       const entry: Outbound = {
         method,
         chatId: payload.chat_id as number | string | undefined,
-        text: text ?? caption ?? '',
+        text: htmlToPlain(raw),
+        html: raw,
         fileId,
         replyMarkup: payload.reply_markup,
+        results: method === 'answerInlineQuery' ? (payload.results as unknown[]) : undefined,
       };
       outbound.push(entry);
       opts.log?.(entry, method, payload);
@@ -157,6 +231,12 @@ export function createHarness(
         },
       } as never);
     },
+    /** An inline query (@bot <query>) from any chat — the bot answers via answerInlineQuery. */
+    inlineQuery: (userId: number, query: string) =>
+      bot.handleUpdate({
+        update_id: updateId++,
+        inline_query: { id: String(updateId), from: from(userId), query, offset: '' },
+      } as never),
     /** A photo message; mediaGroupId marks it as part of an album. */
     sendPhoto: (userId: number, fileId: string, opts2: { mediaGroupId?: string; caption?: string } = {}) =>
       message(userId, {

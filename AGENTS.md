@@ -9,13 +9,19 @@ the full picture, `SCOPE.md` for what is deliberately out of scope.
 ## Commands
 
 ```bash
-npm test            # the full gate: typecheck, build, then all five demo suites
-npm run typecheck   # tsc --noEmit
-npm run build       # tsc → dist/
-npm run demo        # end-to-end run of DEMO.md with the network stubbed
-npm run edge-demo   # adversarial edges: Telegram limits, groups, races, migrations
-npm run rooms-demo  # rooms, room admins, signal detection (AI endpoint stubbed)
-npm run dev         # tsx watch (needs a real BOT_TOKEN in .env)
+npm test                  # the full gate: typecheck (bot + web), build, all demo/smoke suites
+npm run typecheck         # tsc --noEmit (bot); web:typecheck covers web/
+npm run build             # tsc → dist/ + vite build → the Mini App bundle
+npm run core-demo         # the service layer end-to-end (the state machines, no bot)
+npm run demo              # end-to-end run of DEMO.md with the network stubbed
+npm run queue-demo        # the notification delivery queue (retries, rate limit, dedup)
+npm run edge-demo         # adversarial edges: Telegram limits, groups, races, migrations
+npm run rooms-demo        # rooms, room admins, signal detection + AI mode (AI endpoint stubbed)
+npm run agent-tools-demo  # the conversational agent's tool guards (visibility, apply mirror)
+npm run web-smoke         # Mini App tier: initData auth, oRPC reads, payouts, wallet link
+npm run dev               # tsx watch (needs a real BOT_TOKEN in .env)
+npm run db:init           # create + migrate the local docker-compose Postgres
+npm run db:reset          # drop + recreate the local dev database
 ```
 
 `npm test` is the check that matters — CI runs exactly it. `npm run demo`
@@ -28,8 +34,20 @@ OpenAI SDK client still runs) to drive signal detection deterministically.
 ## Architecture rules
 
 - **`src/core/` must not import from Telegraf or `src/bot/`.** It is the
-  framework-free service layer a future API will reuse. Bot code calls core,
-  never the reverse.
+  framework-free service layer both surfaces share — the bot and the Mini App
+  tier (`src/web/`) call core, never the reverse.
+- **The web tier is read-only.** Every mutation (apply, submit, review) stays in
+  the bot; `src/web/api.ts` procedures only read, scoped to the initData-verified
+  caller. Don't add web mutations without treating it as an auth-model change.
+- **Task visibility floor**: a Draft is never public — it may distill private
+  group chatter no human approved for release. Any new surface that resolves a
+  task by id must read through `isTaskPublic`/`getPublicTask` (service.ts) and
+  answer hidden and missing ids identically (no existence oracles), widening
+  only with its own checks (manager-in-DM, engaged applicant).
+- **The conversational agent only proposes.** Its tools read, or render
+  confirmation cards carrying the SAME buttons (`approve:`, `apply:`) and auth
+  guards the classic commands use — a human tap performs every mutation. Don't
+  add a tool that mutates directly.
 - **All state changes go through `src/core/service.ts`**, which validates
   transitions against the tables in `src/core/workflow.ts` and records every
   step in `task_history` inside a transaction. Never update task, application,
@@ -45,7 +63,10 @@ OpenAI SDK client still runs) to drive signal detection deterministically.
   room + score + outcome, nothing else, and signal-drafted tasks keep
   `created_by = NULL` — `/privacy` promises that people who only chat in a
   group with the bot are never recorded. Don't add text/author columns to
-  `signals` without treating it as a privacy change.
+  `signals` without treating it as a privacy change. The RAM-only room context
+  window (`src/bot/roomContext.ts`) is **consent-gated**: it records only after
+  the room's `signals_enabled` check in `handleGroupMessage` — never buffer
+  chatter from rooms that haven't opted in, even in memory.
 - **Role gating is room-aware.** Global admins (`ADMIN_IDS`) manage everything;
   room admins (`room_admins` table) manage only tasks whose `room_chat_id` is a
   room they administer — enforced in `src/bot/index.ts` via `canManageTask` /
@@ -57,6 +78,13 @@ OpenAI SDK client still runs) to drive signal detection deterministically.
   update of the old one. The only deletion path is `/forget` (right-to-erasure),
   which must also scrub history *details* (pitches, "contributor N" mentions),
   not just actor links — see `eraseActor` in `src/core/models/history.ts`.
+  Erasure yields to money exactly once: `forgetContributor` refuses while a
+  funded escrow payout exists — cascading its ledger row away would strand NEAR
+  already deposited on-chain. The guard reads the CHAIN, not just the ledger
+  status: it calls `get_allocation` for every still-owed payout of a linked
+  wallet and refuses if any is funded (failing closed on an RPC error), catching
+  a payout funded on-chain but still `pending` in the DB. Keep that guard ahead
+  of any new cascade.
   Notification rows keep their rendered text after delivery, so `subjectId` is
   a **required** field on enqueue: name the contributor whose personal data the
   content carries, or pass `null` only for task-only content. That field is

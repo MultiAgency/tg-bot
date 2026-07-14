@@ -94,6 +94,23 @@ export async function handledWizardInterrupt(
   return false;
 }
 
+/**
+ * `answerCbQuery` that never throws. A stale/expired callback query — common when
+ * Telegram redelivers a backlog after a restart, by which time a query drained
+ * through `perUserQueue` + DB reads can exceed the answer window — rejects with
+ * 400 "query is too old". Left unhandled that aborts the handler (fatally so
+ * before a `scene.enter`, where the wizard would then silently never start) or
+ * surfaces as an unhandled rejection. The popup is best-effort; swallow the error
+ * so the handler's real work still runs.
+ */
+export function safeAnswerCb(
+  ctx: BotContext,
+  text?: string,
+  extra?: Parameters<BotContext['answerCbQuery']>[1],
+): Promise<unknown> {
+  return ctx.answerCbQuery(text, extra).catch(() => undefined);
+}
+
 /** Typed view of the wizard's scratch state. Scene-enter params land here too — scene state IS the wizard state. */
 export function wizardState(ctx: BotContext): WizardState {
   return ctx.wizard.state as WizardState;

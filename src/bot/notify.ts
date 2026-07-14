@@ -256,6 +256,19 @@ export async function notifyAdminsOfApplication(app: Application, task: Task | u
 export async function buildAnnounceRows(task: Task): Promise<NewNotification[]> {
   const line = taskLine(task);
   const rows: NewNotification[] = [];
+  // A room-scoped task (drafted from — or created for — a group) announces back
+  // INTO that group on approval, so the community whose discussion produced it
+  // actually sees the opportunity. Task-only content (taskLine carries no PII).
+  // Skipped when the room IS the global announce channel, to avoid double-posting.
+  if (task.room_chat_id != null && String(task.room_chat_id) !== config.announceChatId) {
+    rows.push({
+      dedupKey: `announce-room:${task.id}`,
+      chatId: String(task.room_chat_id),
+      subjectId: null,
+      text: clampMessage(t('en', 'notify.announceRoom', { line })),
+      replyMarkup: config.botUsername ? markup(deepLinkApplyButton(task, config.botUsername, 'en')) : null,
+    });
+  }
   if (config.announceChatId) {
     rows.push({
       dedupKey: `announce-chat:${task.id}`,
@@ -338,9 +351,17 @@ export async function notifyRoomAdminPromoted(userId: number, chatId: number, ro
 /**
  * Send a submission's raw file/screenshot directly (not via the queue): this is a
  * synchronous response to the admin viewing /review, not a bot-initiated push.
+ * The reviewer's locale is passed in (not re-read from their stored profile) so
+ * the caption matches the review card rendered beside it — the card resolves from
+ * the live ctx language — and the /review loop makes no per-attachment round trip.
  */
-export async function sendSubmissionAttachment(telegram: Telegram, chatId: number, sub: Submission): Promise<void> {
-  const media = submissionAttachment(sub, await contributorLocale(chatId));
+export async function sendSubmissionAttachment(telegram: Telegram, chatId: number, sub: Submission, locale: string): Promise<void> {
+  const media = submissionAttachment(sub, locale);
   if (!media) return;
-  await sendMedia(telegram, chatId, { kind: media.mediaKind!, fileId: media.mediaFileId!, caption: media.caption ?? undefined });
+  await sendMedia(
+    telegram,
+    chatId,
+    { kind: media.mediaKind!, fileId: media.mediaFileId!, caption: media.caption ?? undefined },
+    { parse_mode: 'HTML' },
+  );
 }

@@ -86,12 +86,12 @@ async function main(): Promise<void> {
   await assert.rejects(() => submitWork(aliceApp.id, BOB, 'text', 'nope'), WorkflowError, 'not your application');
 
   // --- Alice: submit v1 → revise → submit v2 → approve ---
-  const aliceV1 = await submitWork(aliceApp.id, ALICE, 'link', 'https://x.com/draft1');
+  const { submission: aliceV1 } = await submitWork(aliceApp.id, ALICE, 'link', 'https://x.com/draft1');
   assert.equal(aliceV1.version, 1);
   await assert.rejects(() => submitWork(aliceApp.id, ALICE, 'text', 'again'), WorkflowError, 'cannot resubmit while pending review');
   await reviewSubmission(aliceV1.id, ADMIN, 'revise', 'Add the signup link');
   assert.equal((await latestSubmission(aliceApp.id))!.status, 'needs_revision');
-  const aliceV2 = await submitWork(aliceApp.id, ALICE, 'link', 'https://x.com/draft2');
+  const { submission: aliceV2 } = await submitWork(aliceApp.id, ALICE, 'link', 'https://x.com/draft2');
   assert.equal(aliceV2.version, 2);
   await reviewSubmission(aliceV2.id, ADMIN, 'approve', null);
   assert.equal((await latestSubmission(aliceApp.id))!.status, 'approved');
@@ -107,7 +107,7 @@ async function main(): Promise<void> {
   await assert.rejects(() => submitWork(aliceApp.id, ALICE, 'text', 'more'), WorkflowError, 'completed → no resubmit');
 
   // --- Bob: submit → reject (terminal for the submission AND the assignment) ---
-  const bobV1 = await submitWork(bobApp.id, BOB, 'text', 'my thread draft');
+  const { submission: bobV1 } = await submitWork(bobApp.id, BOB, 'text', 'my thread draft');
   await reviewSubmission(bobV1.id, ADMIN, 'reject', 'Off-brand');
   assert.equal((await getContributor(BOB))!.rejected_count, 1);
   assert.equal((await getContributor(BOB))!.assigned_count, 0, 'rejected work is no longer in progress');
@@ -161,7 +161,7 @@ async function main(): Promise<void> {
   await approveTask(revTask.id, ADMIN);
   const ivyApp = await apply(revTask.id, IVY, 'pick me');
   await assignApplication(ivyApp.id, ADMIN);
-  const ivySub = await submitWork(ivyApp.id, IVY, 'text', 'my work');
+  const { submission: ivySub } = await submitWork(ivyApp.id, IVY, 'text', 'my work');
   const reviewOutcomes = await Promise.allSettled([
     reviewSubmission(ivySub.id, ADMIN, 'approve', null),
     reviewSubmission(ivySub.id, ADMIN, 'approve', null),

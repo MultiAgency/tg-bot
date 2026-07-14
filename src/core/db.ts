@@ -37,7 +37,24 @@ types.setTypeParser(1184, (v: string) => new Date(v).toISOString());
 // comes back as a number.
 types.setTypeParser(20, (v: string) => Number(v));
 
-const pool = new Pool({ connectionString: config.databaseUrl });
+// Test isolation: the demo suite shares one test database, and each demo wipes
+// the schema in setup (resetDb → DROP SCHEMA … CASCADE). Two demos running
+// concurrently (parallel CI, a dev running two at once, a stray process) would
+// drop each other's tables mid-run. So when the target is a test database, give
+// each PROCESS its own schema and point search_path at it — concurrent resets
+// then can't collide. Production/dev (any non-_test/_ci database) is untouched:
+// TEST_SCHEMA is null and the pool uses the default public schema.
+export const TEST_SCHEMA = /_test|_ci/i.test(config.databaseUrl) ? `test_p${process.pid}` : null;
+
+const pool = new Pool({
+  connectionString: config.databaseUrl,
+  ...(TEST_SCHEMA ? { options: `-c search_path=${TEST_SCHEMA}` } : {}),
+});
+
+/** TEST ONLY: drop this process's isolated schema (no-op outside a test DB). */
+export async function dropTestSchema(): Promise<void> {
+  if (TEST_SCHEMA) await pool.query(`DROP SCHEMA IF EXISTS ${TEST_SCHEMA} CASCADE`).catch(() => undefined);
+}
 
 // A pooled connection dropped while IDLE (Railway maintenance/failover, an
 // idle-session timeout, a network blip) surfaces only as a Pool 'error' event —

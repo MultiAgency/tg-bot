@@ -1,5 +1,5 @@
-import OpenAI, { type ClientOptions } from 'openai';
 import { config } from '../config.js';
+import { client } from './client.js';
 import type { Task } from '../core/models/task.js';
 
 /**
@@ -9,27 +9,7 @@ import type { Task } from '../core/models/task.js';
  * The human always makes the final decision — AI only drafts and summarizes.
  */
 
-const client = config.nearAiApiKey
-  ? new OpenAI({
-      apiKey: config.nearAiApiKey,
-      baseURL: config.nearAiBaseUrl,
-      // These calls run inside a wizard step, which is serialized per user — a
-      // hung request would otherwise block that user's queue for minutes.
-      timeout: 30_000,
-      maxRetries: 1,
-      // Late-bound platform fetch (the SDK otherwise captures its own bundled
-      // one): identical in production (Node's built-in fetch), and it lets the
-      // demo suites stub this network boundary the way they stub Telegram's.
-      // Cast: the SDK's option is typed against node-fetch, but any
-      // fetch-compatible function (Node's built-in included) is accepted.
-      fetch: ((...args: Parameters<typeof globalThis.fetch>) =>
-        globalThis.fetch(...args)) as unknown as ClientOptions['fetch'],
-    })
-  : null;
-
-export function aiEnabled(): boolean {
-  return client !== null;
-}
+export { aiEnabled } from './client.js';
 
 async function complete(
   kind: string,
@@ -67,6 +47,41 @@ async function complete(
   }
 }
 
+// ---------------------------------------------------------------------------
+// House style — how a drafted task brief should read.
+//
+// Deliberately small: the model's only output is a task brief (title,
+// description, deadline, slots, definition of done), so this steers exactly
+// that and nothing more. The source bot's fuller brand voice / strategy /
+// visual-concept library was for a content-drafting agent (captions, threads,
+// videos) this bot doesn't have — no field here consumes it, so it's omitted
+// rather than paid for on every signal call.
+// ---------------------------------------------------------------------------
+
+const STYLE = `You draft internal task briefs for contributors in a community-coordination bot.
+Write plainly and concretely — no hype, no emoji, no crypto-Twitter clichés
+("alpha", "bullish", "this changes everything", and the like). Say what the work
+is and why it matters now; skip filler and manufactured urgency. Contributors
+keep their own IP. You only draft — a human approves, edits, or discards every
+draft before it reaches anyone.`;
+
+// The structured shape a drafted task must take. Field names match the columns
+// on tasks/NewTaskInput so an approved draft routes with no translation. No
+// reward field: an AI-invented amount is a real expectation a contributor would
+// see, and only a human knows the actual budget source — so reward stays null
+// and is set at approval. (Also no role/refs/specs/assets: no such columns —
+// fold any format, reference, or asset notes into the description instead.)
+const DRAFT_CONTRACT = `Draft the task as a JSON object with these fields:
+  "title":          short, concrete headline (<= 80 chars)
+  "description":    2-4 sentences: what's needed and why it matters now
+  "deadline":       the turnaround the message states, in its own terms, e.g. "within 48h" or
+                    "before Friday's call" — you have no calendar, so never invent a specific date
+                    or clock time the message didn't give; null if none is stated
+  "maxAssignees":   integer 1-20, how many contributors should take this (usually 1-3), or null for 1
+  "requiredOutput": the definition of done — a flat, testable acceptance checklist,
+                    one item per line as "- ...", specific enough to review a submission against, or null
+Do not suggest a reward — a human sets that at approval.`;
+
 /** Draft a clear task description from a short prompt. */
 export function suggestTaskDescription(prompt: string, signal?: AbortSignal): Promise<string | null> {
   return complete(
@@ -91,6 +106,20 @@ export function suggestRequiredOutput(title: string, description: string, signal
   );
 }
 
+/**
+ * Clamp a model-emitted assignee count to the AI drafting cap of 1–20 — never
+ * trust the model with a routing-critical number. Deliberately tighter than the
+ * human ceiling (workflow MAX_ASSIGNEES): an AI draft calling for dozens of
+ * contributors is noise a human can still raise at approval. Anything
+ * non-numeric ("a few", null, absent) becomes null; callers map null to
+ * createTask's default of 1. Shared by both AI drafting paths (signal
+ * evaluation here, the agent's create_task_draft).
+ */
+export function clampSlots(v: unknown): number | null {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN;
+  return Number.isFinite(n) ? Math.min(20, Math.max(1, Math.round(n))) : null;
+}
+
 export interface SignalEvaluation {
   /** 0–10; the caller compares it to config.signalScoreThreshold. */
   score: number;
@@ -99,6 +128,10 @@ export interface SignalEvaluation {
   title: string | null;
   description: string | null;
   requiredOutput: string | null;
+  /** Suggested turnaround; null when the model offers none. */
+  deadline: string | null;
+  /** Clamped to 1–20; null falls back to the createTask default of 1. */
+  maxAssignees: number | null;
 }
 
 /**
@@ -153,6 +186,8 @@ function parseSignalEvaluation(raw: string): SignalEvaluation | null {
     title: text(p.title),
     description: text(p.description),
     requiredOutput: text(p.requiredOutput),
+    deadline: text(p.deadline),
+    maxAssignees: clampSlots(p.maxAssignees),
   };
 }
 
@@ -162,19 +197,38 @@ function parseSignalEvaluation(raw: string): SignalEvaluation | null {
  * like everything here: a positive evaluation only ever creates a DRAFT task —
  * a human still approves it before anyone can apply.
  */
-export async function evaluateSignal(message: string, signal?: AbortSignal): Promise<SignalEvaluation | null> {
+export async function evaluateSignal(
+  message: string,
+  context: string[] = [],
+  signal?: AbortSignal,
+): Promise<SignalEvaluation | null> {
+  // Prior room chatter, clearly fenced off from the message under assessment so
+  // the model scores the right thing but can borrow a deadline or scope that was
+  // mentioned a few lines earlier.
+  const contextBlock = context.length
+    ? 'Recent room chatter, oldest first — context only, NOT the message to assess:\n' +
+      context.map((c) => `- ${c}`).join('\n') +
+      '\n\n'
+    : '';
   const raw = await complete(
     'signal',
-    'You are the signal-detection layer of a contributor-coordination bot watching a community ' +
-      'group chat. Decide whether the message describes concrete work a contributor could be ' +
-      'recruited for (a request, an event needing help, a content opportunity, a community ask). ' +
-      'Score it 0-10 for importance, timeliness, and actionability. Set shouldDraft to true only ' +
-      `if the score is ${config.signalScoreThreshold} or higher AND the message contains enough information to draft a task ` +
-      'someone could act on. Respond with ONLY valid JSON, no prose, no markdown fences, exactly: ' +
+    `${STYLE}\n\n` +
+      'You are the signal-detection layer watching the community group chat. Most chatter is not ' +
+      'a task — ignore banter, questions, and vague ideas. Decide whether the message is a clear, ' +
+      'concrete signal that work should be commissioned: a builder shipped something worth ' +
+      'amplifying, a launch or milestone was announced, an event needs help, or someone explicitly ' +
+      'asks for work to be done. You may use the recent room chatter to fill in a draft, but score ' +
+      'only the message under assessment. Score it 0-10 for importance, timeliness, and ' +
+      `actionability. Set shouldDraft to true only if the score is ${config.signalScoreThreshold} or higher AND there is ` +
+      'enough information (in the message or the context) to draft to standard. When it clears the ' +
+      'bar, draft the task to the contract below.\n\n' +
+      `${DRAFT_CONTRACT}\n\n` +
+      'Respond with ONLY valid JSON, no prose, no markdown fences, exactly: ' +
       '{"score": number, "shouldDraft": boolean, "title": string|null, "description": string|null, ' +
-      '"requiredOutput": string|null}',
-    `Message:\n${message}`,
-    500,
+      '"requiredOutput": string|null, "deadline": string|null, "maxAssignees": number|null}. ' +
+      'Be conservative — when in doubt, shouldDraft is false and the draft fields are null.',
+    `${contextBlock}Message to assess:\n${message}`,
+    700,
     signal,
   );
   return raw ? parseSignalEvaluation(raw) : null;

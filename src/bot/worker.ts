@@ -111,13 +111,34 @@ export async function sendMedia(
   else await sender.sendDocument(chat, media.fileId, opts);
 }
 
+/** Telegram's permanent entity-parse failure — retrying the identical HTML can never succeed. */
+function isEntityParseError(err: unknown): boolean {
+  const e = err as { description?: string; response?: { description?: string } };
+  const desc = e?.description ?? e?.response?.description ?? (err instanceof Error ? err.message : '');
+  return typeof desc === 'string' && desc.includes("can't parse entities");
+}
+
 async function deliver(sender: Sender, row: NotificationRow): Promise<void> {
   const chat = toChat(row.chat_id);
-  const markup = row.reply_markup ? { reply_markup: JSON.parse(row.reply_markup) } : undefined;
-  if (row.media_kind) {
-    await sendMedia(sender, chat, { kind: row.media_kind, fileId: row.media_file_id!, caption: row.caption ?? undefined }, markup);
-  } else {
-    await sender.sendMessage(chat, row.text ?? '', markup);
+  const markup = row.reply_markup ? { reply_markup: JSON.parse(row.reply_markup) } : {};
+  const send = (extra: Record<string, unknown>): Promise<unknown> =>
+    row.media_kind
+      ? sendMedia(sender, chat, { kind: row.media_kind, fileId: row.media_file_id!, caption: row.caption ?? undefined }, extra)
+      : sender.sendMessage(chat, row.text ?? '', extra);
+  // Enqueued text is HTML like everything the bot sends (cards, escaped catalog
+  // strings) — the worker is a send boundary, so parse_mode rides along here the
+  // way the ctx.reply middleware injects it for synchronous replies.
+  try {
+    await send({ parse_mode: 'HTML' as const, ...markup });
+  } catch (err) {
+    if (!isEntityParseError(err)) throw err;
+    // A parse failure is permanent: the row would burn its whole retry budget on
+    // the same 400 and be marked failed — the contributor silently loses the
+    // DM. Rows enqueued by a build predating the HTML formatter (still queued
+    // across the deploy) hit exactly this; so would any future escaping bug.
+    // For a notification, delivery beats formatting: resend as plain text.
+    console.warn(`[notify-worker] notification ${row.id} failed HTML parse — resending as plain text`);
+    await send(markup);
   }
 }
 

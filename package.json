@@ -8,9 +8,11 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && vite build",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
+    "web:dev": "vite",
+    "web:typecheck": "tsc --noEmit -p web/tsconfig.json",
     "db:init": "DATABASE_URL=${DATABASE_URL:-postgresql://multiagency:multiagency@localhost:5455/multiagency} tsx scripts/db-init.ts",
     "db:reset": "DATABASE_URL=${DATABASE_URL:-postgresql://multiagency:multiagency@localhost:5455/multiagency} tsx scripts/db-reset.ts",
     "core-demo": "DATABASE_URL=${TEST_DATABASE_URL:-postgresql://multiagency:multiagency@localhost:5455/multiagency_test} BOT_TOKEN=000000:demo ADMIN_IDS=1 tsx scripts/core-demo.ts",
@@ -18,19 +20,37 @@
     "queue-demo": "DATABASE_URL=${TEST_DATABASE_URL:-postgresql://multiagency:multiagency@localhost:5455/multiagency_test} BOT_TOKEN=000000:demo ADMIN_IDS=1 tsx scripts/queue-demo.ts",
     "edge-demo": "DATABASE_URL=${TEST_DATABASE_URL:-postgresql://multiagency:multiagency@localhost:5455/multiagency_test} BOT_TOKEN=000000:demo ADMIN_IDS=1 BOT_USERNAME=DemoBot NEAR_AI_API_KEY= NOTIFY_RATE_PER_SEC=1000 tsx scripts/edge-demo.ts",
     "rooms-demo": "DATABASE_URL=${TEST_DATABASE_URL:-postgresql://multiagency:multiagency@localhost:5455/multiagency_test} BOT_TOKEN=000000:demo ADMIN_IDS=1 BOT_USERNAME=DemoBot NEAR_AI_API_KEY=demo-stub SIGNAL_MAX_PER_HOUR=3 NOTIFY_RATE_PER_SEC=1000 tsx scripts/rooms-demo.ts",
+    "agent-tools-demo": "DATABASE_URL=${TEST_DATABASE_URL:-postgresql://multiagency:multiagency@localhost:5455/multiagency_test} BOT_TOKEN=000000:demo ADMIN_IDS=1 NEAR_AI_API_KEY= MAX_OPEN_APPLICATIONS=2 tsx scripts/agent-tools-demo.ts",
+    "web-smoke": "DATABASE_URL=${TEST_DATABASE_URL:-postgresql://multiagency:multiagency@localhost:5455/multiagency_test} BOT_TOKEN=000000:demo ADMIN_IDS=1 ESCROW_CONTRACT_ID=escrow.agency.testnet NEAR_TREASURY_ID=agency.testnet tsx scripts/web-smoke.ts",
+    "preview": "npm run build && DATABASE_URL=${TEST_DATABASE_URL:-postgresql://multiagency:multiagency@localhost:5455/multiagency_test} BOT_TOKEN=000000:demo ADMIN_IDS=1 tsx scripts/preview.ts",
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
-    "test": "npm run typecheck && npm run build && npm run core-demo && npm run demo && npm run queue-demo && npm run edge-demo && npm run rooms-demo"
+    "test": "npm run typecheck && npm run web:typecheck && npm run build && npm run core-demo && npm run demo && npm run queue-demo && npm run edge-demo && npm run rooms-demo && npm run agent-tools-demo && npm run web-smoke",
+    "ai-smoke": "DATABASE_URL=postgresql://x tsx scripts/ai-smoke.ts",
+    "ai-agent-smoke": "DATABASE_URL=${TEST_DATABASE_URL:-postgresql://multiagency:multiagency@localhost:5455/multiagency_test} BOT_TOKEN=000000:demo ADMIN_IDS=1 tsx scripts/ai-agent-smoke.ts"
   },
   "dependencies": {
-    "dotenv": "^16.4.7",
-    "openai": "^4.104.0",
+    "@hono/node-server": "^2.0.8",
+    "@hot-labs/near-connect": "^0.11.4",
+    "@orpc/client": "^1.14.8",
+    "@orpc/server": "^1.14.8",
+    "dotenv": "^17.4.2",
+    "hono": "^4.12.30",
+    "near-kit": "^0.18.0",
+    "openai": "^6.46.0",
     "pg": "^8.22.0",
-    "telegraf": "^4.16.3"
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "telegraf": "^4.16.3",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
+    "@types/node": "^26.1.1",
     "@types/pg": "^8.20.0",
-    "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.4"
   }
 }

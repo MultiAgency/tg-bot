@@ -6,8 +6,11 @@ human-in-the-loop **apply → admin assigns → submit → review** workflow.
 Contributors *apply* to open tasks with a short pitch; admins review applicants
 and *assign* the task (up to its `max_assignees`); assigned contributors *submit*
 work (versioned — each revision is a new version); reviewers approve, reject, or
-request revision. AI assists with drafting and summaries; humans make every
-final decision.
+request revision. AI assists — drafting, summaries, group signal detection, and
+an opt-in conversational agent — but humans make every final decision. An
+optional read-mostly **Telegram Mini App** mirrors the open-task board, a
+contributor's work, and their payouts; approved rewarded work lands in a payout
+ledger settled through a NEAR claim escrow.
 
 See [SCOPE.md](SCOPE.md) for boundaries and [DEMO.md](DEMO.md) for the pilot script.
 
@@ -51,16 +54,20 @@ npm run dev                          # watch mode, or:  npm run build && npm sta
 
 `initSchema()` also runs the migrations automatically on every boot, so `npm start`
 is self-bootstrapping. To check the whole loop without touching Telegram, `npm test`
-runs typecheck, build, and the five demo suites end-to-end against the real bot stack
-(middleware, scenes, buttons) with the network stubbed and a **scratch schema reset per
-run**. The demos run against a **separate `multiagency_test` database** (created by
-docker-compose, sourced via `TEST_DATABASE_URL`), so the reset can never wipe the dev
-data in `multiagency` — even if you have `DATABASE_URL` exported. `npm run edge-demo` drives the adversarial edges the happy
+runs typecheck (bot and web), build, and the demo/smoke suites end-to-end against the
+real bot stack (middleware, scenes, buttons) with the network stubbed and a **scratch
+schema reset per run**. The demos run against a **separate `multiagency_test` database**
+(created by docker-compose, sourced via `TEST_DATABASE_URL`), so the reset can never wipe
+the dev data in `multiagency` — even if you have `DATABASE_URL` exported.
+`npm run edge-demo` drives the adversarial edges the happy
 path skips — Telegram size limits (its stub rejects oversized messages like the live
 API), group-vs-private privacy surfaces, photo albums, the /forget mid-delivery race,
 and the migration version check. `npm run rooms-demo` covers rooms and signal detection
 (AI endpoint stubbed): the group bootstrap, the signal pipeline and its privacy
-invariants, and room-admin-scoped task management.
+invariants, and room-admin-scoped task management. `npm run agent-tools-demo` covers
+the conversational agent's tool guards (visibility, apply mirroring, draft gating);
+`npm run web-smoke` drives the Mini App server — initData auth, the read-only oRPC
+API, payouts, and the NEAR wallet link — over the same test database.
 
 ### Environment (`.env`)
 
@@ -76,20 +83,31 @@ invariants, and room-admin-scoped task management.
 | `NEAR_AI_API_KEY`  | –        | [NEAR AI Cloud](https://cloud.near.ai) key. Enables AI assistance; omit to run without AI (fully functional). |
 | `NEAR_AI_BASE_URL` | –        | OpenAI-compatible endpoint (default `https://cloud-api.near.ai/v1`)                                                             |
 | `AI_MODEL`         | –        | AI model (default `deepseek-ai/DeepSeek-V4-Flash`, a private-TEE chat model; see [`/v1/models`](https://cloud-api.near.ai/v1/models)) |
+| `AGENT_MODEL`      | –        | Model for the conversational agent (group `/ai` mode) — needs reliable tool calling, so it defaults to `anthropic/claude-haiku-4-5` on the same endpoint |
 | `SIGNAL_SCORE_THRESHOLD` | –  | Minimum AI score (0–10) a group message must reach to auto-draft a task (default `6`) |
 | `SIGNAL_MAX_PER_HOUR` | –     | Max AI evaluations per room per hour — bounds the AI bill of a flooded group (default `20`) |
+| `WEB_PORT` / `PORT` | –       | Port for the in-process Mini App web server (Railway injects `PORT`). Unset leaves the web tier off — the plain bot deployment is unchanged |
+| `WEB_APP_URL`      | –        | Public HTTPS origin the Mini App is served from; wires the Telegram chat-menu / home-menu board buttons. Empty leaves them off |
+| `NEAR_NETWORK`     | –        | NEAR network the claim escrow lives on (default `testnet`)                                                                       |
+| `ESCROW_CONTRACT_ID` | –      | The claim-escrow contract account (see `contracts/escrow`). Empty keeps the claim UI dormant                                     |
+| `NEAR_TREASURY_ID` | –        | Treasury account that signs `allocate` — the bot never holds its key; `/payouts` prints the command for a treasury admin to run |
 
 ## Commands
 
 **Contributors**
 
-- `/open` — browse open tasks, tap **Apply** and send a short pitch (fully-assigned
-  tasks stay visible but take no applications)
+- `/start` — home menu: board (Mini App, when configured), browse, my work,
+  settings, help
+- `/open` — browse open tasks one card at a time (◀ ▶ to flip), tap **Apply**
+  and send a short pitch; **Share** drops the card into any other chat via
+  inline mode (fully-assigned tasks stay visible but take no applications)
+- `@<bot> <query>` in any chat — inline mode: search open tasks and share one as
+  a card with an Apply deep link
 - `/myapps` — your applications + states; tap **Submit** on assigned ones
 - `/submit <applicationId>` — submit work (text, link, file, screenshot, or video; captions kept)
 - `/withdraw <applicationId>` — withdraw an application
-- `/notify on` / `/notify off` — opt in/out of a DM when a new task opens (off by
-  default; the announce channel is the primary broadcast)
+- `/notify on` / `/notify off` (or the `/settings` toggle) — opt in/out of a DM
+  when a new task opens (off by default; the announce channel is the primary broadcast)
 - `/status <taskId>` — a task's public status and history (personal history events
   appear only in a DM; groups see task-level events only)
 - `/privacy` — what the bot stores, retention, the AI data flow, and how erasure works
@@ -107,9 +125,14 @@ invariants, and room-admin-scoped task management.
   re-sent, and a **📄 Full submission** button on any card that had to clip long content
 - `/close <taskId>` / `/reopen <taskId>` — stop / resume accepting applications
 - `/unassign <applicationId>` — remove an assignment (records a reason, notifies the contributor)
+- `/payouts` — the funding queue: payouts owed for approved rewarded work, each
+  with the contributor's linked wallet state and (when linked) the exact
+  treasury `allocate` command; reconciles stored status against the chain
 - `/forget <contributorId>` — erase a contributor's data (profile, applications,
-  submissions; history details scrubbed; task authorship cleared; notification
-  rows to or about them purged)
+  submissions, payout ledger rows; history details scrubbed; task authorship
+  cleared; notification rows to or about them purged). Refused while a funded
+  (`claimable`) escrow payout awaits claim — erasing its ledger row would
+  strand NEAR already deposited on-chain
 
 `/cancel` aborts any multi-step wizard.
 
@@ -130,6 +153,10 @@ is manageable only by global admins.
 - `/enablesignals` / `/disablesignals` — turn AI signal detection on/off for
   this group (room admins or global admins; needs AI enabled). Turning it on
   posts a public notice in the group — that's the members' disclosure.
+- `/ai on|off|status` — conversational AI mode for this group (same gating and
+  the same public notice; status answers any member)
+- `/settings` — one tap-toggle panel folding the two room toggles (the panel is
+  public; authorization is enforced on the tap)
 - `/signalstatus` — is this group being scanned? (answers any member)
 - `/addroomadmin` / `/removeroomadmin` — **reply to a message** from the person,
   then send the command (bots can't resolve @username → id); the person is
@@ -150,13 +177,33 @@ admins and global admins are notified of every auto-draft.
 **Privacy invariants** (see `/privacy`): the message text goes to the model and
 is then dropped — a signal row stores only room, score, and outcome; the
 author's identity is stored nowhere (`created_by` stays null on signal-drafted
-tasks). Group members who never DM the bot are never recorded, same as always.
+tasks). A short **context window** of the room's recent chatter accompanies each
+evaluation (so a draft can pick up a deadline mentioned a few lines earlier) —
+it is RAM-only, bounded (15 messages / 30 minutes), never persisted, and
+recorded **only for rooms that opted in**; chatter from rooms that never ran
+`/enablesignals` never enters it. Group members who never DM the bot are never
+recorded, same as always.
 
 **Telegram requirement:** under default privacy mode the bot only receives
-commands in groups, so signal detection needs one of: **promote the bot to
-admin in that specific group** (recommended — scoping stays per-group), or turn
-privacy mode off globally via @BotFather (`/setprivacy`, then re-add the bot to
-the group). All other features work fine without either.
+commands in groups, so signal detection (and addressing the agent by @mention)
+needs one of: **promote the bot to admin in that specific group** (recommended —
+scoping stays per-group), or turn privacy mode off globally via @BotFather
+(`/setprivacy`, then re-add the bot to the group). All other features work fine
+without either.
+
+## AI mode (opt-in, per group)
+
+Where a room admin ran `/ai on`, members talk to the bot in natural language by
+**addressing it** — an @mention or a reply to one of its messages. It answers
+via a tool-calling loop (browse tasks, look one up, list your applications) and
+*proposes* actions as confirmation cards: a task draft shows the admin the same
+**Approve** button `/approve` uses; an apply suggestion shows the same **Apply**
+button — a human still taps, through the identical auth and workflow guards, so
+the agent can never create, open, or apply on its own. It runs on a stronger
+tool-calling model (`AGENT_MODEL`) than signal scoring, on the same NEAR AI
+endpoint. Conversation memory is RAM-only, bounded, and expires after minutes;
+ambient (unaddressed) chatter is untouched unless signal detection is also on —
+the two features compose per room.
 
 ## Notifications
 
@@ -197,8 +244,36 @@ When `NEAR_AI_API_KEY` is set:
   required-output items that appear missing — observations only, never a verdict
 - Score group messages into Draft tasks where signal detection is enabled
   (see "Signal detection" above)
+- Converse in groups with AI mode on — proposing drafts and applications as
+  confirmation cards a human still taps (see "AI mode" above)
 
 AI never approves contributors or submissions, and never opens a task.
+
+## Mini App & payouts (NEAR)
+
+An optional **Telegram Mini App** (React, served by an in-process Hono server
+behind `WEB_PORT`/`PORT`) mirrors the bot **read-mostly**: the open-task board,
+task detail, your applications, and your payouts. Every mutation (apply, submit,
+review) stays in the bot — the app deep-links back into it. The oRPC API is
+gated by Telegram **initData** verification (identity, not entitlement: drafts
+are never served), runs on the same Postgres pool and `src/core/` service layer,
+and is caller-scoped — you can only read your own work. `web-smoke` covers the
+whole tier.
+
+Approving rewarded work records a row in the **payout ledger** (same transaction
+as the approval). Settlement is contributor-pull through a NEAR **claim escrow**
+(`contracts/escrow`): the treasury allocates + funds a payout on-chain (the
+`/payouts` admin command prints the exact `near` CLI command — the bot never
+holds a key), and the contributor claims it from their own wallet. Contributors
+link a wallet in the Mini App via a NEP-413 signed challenge, and claim funded
+payouts from the Payouts screen with that wallet (near-connect; `claimable` is
+read live from the chain per payout).
+
+**Privacy note:** funding and claiming write the linked NEAR account and the
+task id to the public NEAR blockchain — permanently. Nothing on-chain names the
+Telegram identity, and `/forget` erases the stored wallet link between the two,
+but the on-chain record is beyond erasure; `/privacy` discloses this, and the
+wallet-link UI must surface it at the moment of linking.
 
 ## Internationalization
 
@@ -224,14 +299,16 @@ English fallback for any unknown locale or key.
 
 ## Deployment (Railway)
 
-The bot uses long polling, so it deploys as a plain worker — no public port,
-domain, or webhook needed. `railway.json` configures the build and restart
-policy.
+The bot uses long polling, so on its own it deploys as a plain worker — no
+public port, domain, or webhook needed. The optional Mini App is the exception:
+it serves HTTP from the same process, so enabling it means exposing the service
+(Railway injects `PORT`; attach a domain and set `WEB_APP_URL` to it).
+`railway.json` configures the build and restart policy.
 
 1. Add the **Railway PostgreSQL** plugin to the project — it injects `DATABASE_URL`
    into the service automatically.
 2. Set the service variables: `BOT_TOKEN`, `ADMIN_IDS`, and optionally the NEAR AI /
-   announcement variables. (`DATABASE_URL` comes from the plugin.)
+   announcement / Mini App / escrow variables. (`DATABASE_URL` comes from the plugin.)
 3. Deploy with `railway up` (or connect the GitHub repo for deploys on push).
    `initSchema()` applies any pending migrations on boot — no manual step.
 
@@ -281,10 +358,12 @@ Dashboard/manual steps no config file can do:
 **Data protection.** The Postgres database stores personal data — contributor
 Telegram usernames, display names, and user IDs. Restrict access to the Railway
 project and its Postgres plugin, and don't copy the database to untrusted
-environments. Profiles are only created for people who DM the bot (group members
-are never recorded), `/privacy` states the retention rules to users, and `/forget`
-handles deletion requests (deleting active rows immediately; managed backups age
-out per the configured retention).
+environments. Profiles are only created by a user-initiated act — DMing the bot
+or linking a wallet in the Mini App; group members are never recorded passively.
+`/privacy` states the retention rules to users, and `/forget` handles deletion
+requests (deleting active rows immediately; managed backups age out per the
+configured retention; funded-but-unclaimed payouts sequence erasure behind a
+claim or revoke).
 
 **Schema migrations.** The schema is a set of sequential, forward-only SQL files
 in `db/migrations/` (`001_initial.sql`, `002_rooms.sql`, …), applied once each at
@@ -298,26 +377,40 @@ pending migrations; `npm run db:reset` (test only) rebuilds from scratch.
 ```
 src/
   config.ts            env + admin checks
-  core/                framework-free service layer (reusable by a future API)
+  core/                framework-free service layer (shared by the bot and the web tier)
     db.ts              Postgres pool, AsyncLocalStorage tx runner, file migration runner
   ../db/migrations/    forward-only *.sql schema migrations
     workflow.ts        three state machines (task, application, submission)
-    service.ts         orchestration: approve/apply/assign/submit/review/erase, rooms & signals
-    models/            task, application, submission, contributor, history, notification, room, signal
-  ai/assist.ts         optional NEAR AI Cloud helpers (degrade gracefully)
+    service.ts         orchestration: approve/apply/assign/submit/review/erase, rooms,
+                       signals, payouts; shared reads + the task-visibility floor
+    models/            task, application, submission, contributor, history, notification,
+                       room, signal, payout, walletLink
+  ai/
+    assist.ts          optional NEAR AI Cloud helpers (degrade gracefully)
+    agent.ts           conversational agent loop (RAM-only convo memory)
+    agentTools.ts      the agent's tools — read + propose-via-card only
+    client.ts          shared OpenAI-compatible client
   bot/                 Telegraf layer (commands, scenes, keyboards, i18n)
     notify.ts          notification producers (render + enqueue, never send inline)
     worker.ts          single global queue worker (paced delivery, retry, backoff)
-    signals.ts         signal-detection pipeline (prefilter → budget → AI → Draft)
-  index.ts             entry point (long polling; starts the notification worker)
+    signals.ts         signal-detection pipeline (prefilter → opt-in → context → AI → Draft)
+    roomContext.ts     RAM-only per-room context window (consent-gated)
+  web/                 Mini App tier: Hono server, oRPC read API, initData auth,
+                       NEP-413 wallet link
+  near/escrow.ts       claim-escrow reads + the treasury allocate command
+  index.ts             entry point (long polling; starts the worker + web server)
+web/                   Mini App frontend (React + Vite)
+contracts/escrow/      NEAR claim-escrow contract (Rust; see its README)
 ```
 
-The `core/` layer has **zero Telegram coupling** — a web/API layer (e.g. Hono + oRPC +
-better-auth) can call the same service functions later with no rework.
+The `core/` layer has **zero Telegram coupling** — the web tier (`src/web/`)
+calls the same service functions the bot does.
 
 ## Not in this MVP (deferred)
 
-Web dashboard, multi-channel support, automated candidate scoring, task↔candidate
-matching, auto-assignment, deadline automation (reminders/expiry), reward
-automation / on-chain payouts, agent memory, and advanced reputation/anti-fraud.
-Rewards are recorded as free text (e.g. `100 USDC`).
+Admin web dashboard (the Mini App is contributor-facing and read-mostly),
+multi-channel support, automated
+candidate scoring, task↔candidate matching, auto-assignment, deadline
+automation (reminders/expiry), reward-amount automation (rewards are free text,
+e.g. `100 USDC`; on-chain amounts are set by the treasury at escrow funding),
+agent memory beyond the in-RAM window, and advanced reputation/anti-fraud.

@@ -1,4 +1,4 @@
-import { query, initSchema } from '../src/core/db.js';
+import { query, initSchema, TEST_SCHEMA } from '../src/core/db.js';
 
 /**
  * TEST-ONLY: drop and recreate the public schema, then re-apply migrations, for a
@@ -17,6 +17,10 @@ export async function resetDb(): Promise<void> {
         'Set ALLOW_DB_RESET=1 to override.',
     );
   }
-  await query('DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;');
+  // Reset THIS process's schema — its own isolated one under test isolation
+  // (TEST_SCHEMA), else public. Isolation means a concurrent demo's reset targets
+  // a different schema and can't drop the tables out from under this one.
+  const schema = TEST_SCHEMA ?? 'public';
+  await query(`DROP SCHEMA IF EXISTS ${schema} CASCADE; CREATE SCHEMA ${schema};`);
   await initSchema();
 }

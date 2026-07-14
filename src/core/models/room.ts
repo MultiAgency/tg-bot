@@ -13,6 +13,7 @@ export interface Room {
   chat_id: number;
   title: string | null;
   signals_enabled: 0 | 1;
+  ai_enabled: 0 | 1;
   created_at: string;
   updated_at: string;
 }
@@ -46,6 +47,13 @@ export async function getRoomForUpdate(chatId: number): Promise<Room | undefined
 export async function setSignalsEnabled(chatId: number, enabled: boolean): Promise<Room> {
   return (await one<Room>(
     'UPDATE rooms SET signals_enabled = $1, updated_at = $2 WHERE chat_id = $3 RETURNING *',
+    [enabled ? 1 : 0, nowIso(), chatId],
+  ))!;
+}
+
+export async function setAiEnabled(chatId: number, enabled: boolean): Promise<Room> {
+  return (await one<Room>(
+    'UPDATE rooms SET ai_enabled = $1, updated_at = $2 WHERE chat_id = $3 RETURNING *',
     [enabled ? 1 : 0, nowIso(), chatId],
   ))!;
 }

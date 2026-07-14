@@ -1,4 +1,12 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+
+// Local developer overrides load FIRST (first file wins in dotenv), so a
+// gitignored .env.local can carry machine-local values — the throwaway bot
+// token for live local runs, a web port, a tunnel URL — without touching the
+// shared .env. Real environment variables still beat both (dotenv never
+// overrides an already-set var), which is what the demo scripts rely on.
+// .env.local is never deployed; production reads real env vars via .env alone.
+dotenv.config({ path: ['.env.local', '.env'] });
 
 function required(name: string): string {
   const value = process.env[name];
@@ -48,6 +56,11 @@ export const config = {
   // Avoid reasoning-style models (gpt-oss, qwen3.x) — they spend the whole token
   // budget on reasoning_content and return empty content for short completions.
   aiModel: process.env.AI_MODEL ?? 'deepseek-ai/DeepSeek-V4-Flash',
+  // The conversational agent (group /ai mode) runs a tool-calling loop, which
+  // needs reliable, well-formed tool_calls — DeepSeek-Flash emits malformed
+  // arguments, so the agent defaults to a stronger model on the same NEAR AI
+  // endpoint. Signal scoring stays on the cheaper aiModel.
+  agentModel: process.env.AGENT_MODEL ?? 'anthropic/claude-haiku-4-5',
   // Public-launch guardrails: cap how many open (undecided) applications one
   // contributor can hold at once, to stop apply-spam.
   maxOpenApplications: positiveNumber('MAX_OPEN_APPLICATIONS', 5),
@@ -71,6 +84,21 @@ export const config = {
   // Cap on AI evaluations per room per hour, enforced against stored signal
   // rows so it survives restarts. Bounds the AI bill of a flooded group.
   signalMaxPerHour: positiveNumber('SIGNAL_MAX_PER_HOUR', 20),
+  // Mini App web server: the port the bot process serves the web app + oRPC API
+  // on (Railway injects PORT). 0 (unset) leaves the web server off, so the plain
+  // bot deployment is unchanged. Shares this process's Postgres pool.
+  webPort: positiveNumber('WEB_PORT', 0) || positiveNumber('PORT', 0),
+  // Public HTTPS origin the Mini App is served from (e.g. https://app.example.com)
+  // — used to wire the Telegram menu button / web_app button. Empty leaves them off.
+  webAppUrl: process.env.WEB_APP_URL ?? '',
+  // NEAR payout: the claim-escrow contract account (contracts/escrow — the
+  // treasury allocates+funds, the contributor pulls; the bot never signs) and
+  // the network it lives on. Empty escrow id leaves the claim UI dormant.
+  nearNetwork: process.env.NEAR_NETWORK ?? 'testnet',
+  escrowContractId: process.env.ESCROW_CONTRACT_ID ?? '',
+  // The escrow owner / treasury account (signs `allocate`). The bot never holds
+  // its key — /payouts just prints the exact command for a treasury admin to run.
+  nearTreasuryId: process.env.NEAR_TREASURY_ID ?? '',
 } as const;
 
 export function isAdmin(telegramId: number | undefined): boolean {

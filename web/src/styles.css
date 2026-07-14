@@ -1,0 +1,413 @@
+/*
+ * "Ledger" — a crafted, editorial-utilitarian bounty board for a Telegram Mini
+ * App. It reads Telegram's theme variables (--tg-theme-*) so it is native and
+ * adapts to each user's light/dark, but carries a distinct voice: a Fraunces
+ * display serif for titles, JetBrains Mono for the numeric ledger (ids, rewards,
+ * deadlines), hairline rules between task "entries", and one staggered reveal.
+ */
+
+:root {
+  /* Telegram theme, with a warm-paper light fallback for out-of-Telegram dev. */
+  --bg: var(--tg-theme-bg-color, #f7f4ec);
+  --surface: var(--tg-theme-secondary-bg-color, #fffdf8);
+  --text: var(--tg-theme-text-color, #1c1a15);
+  --hint: var(--tg-theme-hint-color, #8f897a);
+  --link: var(--tg-theme-link-color, #b4531f);
+  --accent: var(--tg-theme-button-color, #c25a2a);
+  --accent-ink: var(--tg-theme-button-text-color, #fffdf8);
+  --danger: var(--tg-theme-destructive-text-color, #c1442e);
+
+  --rule: color-mix(in srgb, var(--hint) 26%, transparent);
+  --rule-soft: color-mix(in srgb, var(--hint) 14%, transparent);
+  --accent-wash: color-mix(in srgb, var(--accent) 12%, transparent);
+
+  --font-display: 'Fraunces', Georgia, 'Times New Roman', serif;
+  --font-body: 'Instrument Sans', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
+
+  --pad: 18px;
+  --radius: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* A whisper of grain for depth — never noticeable, only felt. */
+  background-image: radial-gradient(color-mix(in srgb, var(--hint) 5%, transparent) 0.5px, transparent 0.5px);
+  background-size: 4px 4px;
+  overscroll-behavior-y: contain;
+}
+
+#root {
+  max-width: 640px;
+  margin: 0 auto;
+  min-height: 100vh;
+  padding: calc(var(--pad) + env(safe-area-inset-top)) var(--pad) calc(96px + env(safe-area-inset-bottom));
+}
+
+/* ---- Masthead ---- */
+.masthead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding-bottom: 14px;
+  border-bottom: 1.5px solid var(--text);
+  margin-bottom: 4px;
+}
+.masthead h1 {
+  font-family: var(--font-display);
+  font-optical-sizing: auto;
+  font-weight: 600;
+  font-size: 30px;
+  letter-spacing: -0.02em;
+  margin: 0;
+  line-height: 1;
+}
+.masthead .edition {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--hint);
+}
+
+/* ---- Tabs ---- */
+.tabs {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  gap: 2px;
+  padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid var(--rule-soft);
+  z-index: 20;
+}
+.tabs button {
+  flex: 1;
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--hint);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 10px 0;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+.tabs button.active {
+  color: var(--accent);
+  background: var(--accent-wash);
+  font-weight: 600;
+}
+
+/* ---- Ledger entries (task rows) ---- */
+.filterbar {
+  margin: 16px 0 4px;
+}
+.filterbar input {
+  width: 100%;
+  appearance: none;
+  border: 1px solid var(--rule);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 11px 13px;
+  border-radius: 10px;
+  outline: none;
+}
+.filterbar input:focus {
+  border-color: var(--accent);
+}
+.filterbar input::placeholder {
+  color: var(--hint);
+}
+
+.ledger {
+  margin-top: 8px;
+}
+
+.entry {
+  display: block;
+  width: 100%;
+  text-align: left;
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--rule);
+  padding: 16px 2px;
+  cursor: pointer;
+  color: inherit;
+  animation: rise 0.5s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+.entry:last-child {
+  border-bottom: 1px solid var(--rule);
+}
+.entry:active {
+  background: var(--accent-wash);
+}
+.entry .top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+.entry .id {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--hint);
+}
+.entry .title {
+  font-family: var(--font-display);
+  font-optical-sizing: auto;
+  font-weight: 500;
+  font-size: 19px;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  margin: 3px 0 8px;
+}
+.entry .meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  align-items: center;
+}
+
+.reward {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--accent);
+  white-space: nowrap;
+}
+.dim {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--hint);
+}
+
+.chip {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--rule);
+  color: var(--hint);
+  white-space: nowrap;
+}
+.chip.full {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+}
+.chip.open {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.chip.applied { color: var(--link); }
+.chip.assigned { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+.chip.completed { color: #2e8b57; border-color: color-mix(in srgb, #2e8b57 40%, transparent); }
+.chip.rejected, .chip.declined { color: var(--danger); }
+
+/* ---- Detail ---- */
+.detail h2 {
+  font-family: var(--font-display);
+  font-optical-sizing: auto;
+  font-weight: 600;
+  font-size: 26px;
+  letter-spacing: -0.02em;
+  line-height: 1.12;
+  margin: 18px 0 10px;
+}
+.detail .facts {
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+  padding: 4px 0;
+  margin: 14px 0;
+}
+.detail .fact {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.detail .fact:last-child {
+  border-bottom: none;
+}
+.detail .fact .k {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--hint);
+}
+.detail .fact .v {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  text-align: right;
+}
+.detail .prose {
+  font-size: 15px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  margin: 8px 0 20px;
+}
+.detail .section-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--hint);
+  margin: 18px 0 4px;
+}
+
+.back {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--hint);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  padding: 6px 0;
+  cursor: pointer;
+}
+
+/* ---- Primary action ---- */
+.cta {
+  display: block;
+  width: 100%;
+  appearance: none;
+  border: none;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-family: var(--font-body);
+  font-weight: 600;
+  font-size: 16px;
+  padding: 15px;
+  border-radius: 12px;
+  cursor: pointer;
+  box-shadow: 0 6px 18px -8px color-mix(in srgb, var(--accent) 70%, transparent);
+  transition: transform 0.1s;
+}
+.cta:active {
+  transform: translateY(1px);
+}
+.cta.ghost {
+  background: transparent;
+  color: var(--accent);
+  border: 1.5px solid var(--accent);
+  box-shadow: none;
+}
+
+/* ---- Wallet (Payouts screen) ---- */
+.wallet {
+  margin: 16px 0 8px;
+  padding: 14px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.wallet-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.wallet .dim {
+  margin: 0 0 6px;
+}
+.wallet .disclosure {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--hint);
+  margin: 0 0 12px;
+  padding-left: 10px;
+  border-left: 2px solid var(--rule);
+}
+.mono {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--accent);
+  word-break: break-all;
+}
+.wallet-err {
+  color: var(--danger);
+  font-size: 13px;
+  margin: 6px 2px 0;
+}
+
+/* ---- States ---- */
+.empty,
+.loading {
+  text-align: center;
+  padding: 64px 20px;
+  color: var(--hint);
+}
+.empty .mark {
+  font-family: var(--font-display);
+  font-size: 40px;
+  color: var(--rule);
+  display: block;
+  margin-bottom: 10px;
+}
+.empty p {
+  font-size: 14px;
+  margin: 4px 0;
+}
+
+.spinner {
+  width: 22px;
+  height: 22px;
+  border: 2px solid var(--rule);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  margin: 0 auto;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .entry {
+    animation: none;
+  }
+}

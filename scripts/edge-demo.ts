@@ -42,7 +42,7 @@ const USERS = {
 };
 
 const bot = createBot();
-const { outbound, apiErrors, onApi, since, repliesTo, say, sayIn, tap, sendPhoto, sendVideo, sendVideoNote } =
+const { outbound, apiErrors, onApi, since, repliesTo, say, sayIn, tap, inlineQuery, sendPhoto, sendVideo, sendVideoNote } =
   createHarness(bot, USERS);
 const groupChat = { id: GROUP, type: 'supergroup', title: 'Pilot Group' };
 const sayInGroup = (userId: number, text: string) => sayIn(groupChat, userId, text);
@@ -142,6 +142,30 @@ async function main(): Promise<void> {
   ok(`submit prompt delivered (${subPrompt!.text.length} chars) and /cancel exits — no trap`);
 
   // -------------------------------------------------------------------------
+  step('2c. HTML-significant characters in a title are escaped, never injected');
+  // Every message goes out under parse_mode:'HTML' — an unescaped title could
+  // break the send (400) or inject markup. The transport's assertValidHtml would
+  // already throw on a malformed message; this proves the ESCAPE path too: the
+  // raw bytes carry entities, and the user-visible text is the literal string.
+  const EVIL = '<b>bold</b> & <img src=x> "q"';
+  await say(ADMIN, '/newtask');
+  await say(ADMIN, EVIL);
+  await say(ADMIN, 'Injection probe.');
+  await say(ADMIN, '-');
+  await say(ADMIN, '-');
+  await say(ADMIN, '-');
+  await say(ADMIN, '1');
+  await say(ADMIN, '/approve');
+  await tap(ADMIN, 'approve:3');
+  mark = outbound.length;
+  await say(ADMIN, '/status 3');
+  const evilCard = repliesTo(mark, ADMIN).find((o) => o.text.includes('Injection probe'))!;
+  assert.ok(evilCard.html.includes('&lt;b&gt;bold&lt;/b&gt;'), 'title tags were escaped to entities in the raw send');
+  assert.ok(!/<img|<b>bold<\/b>/.test(evilCard.html), 'no raw user-supplied tag survived into the HTML');
+  assert.ok(evilCard.text.includes(EVIL), 'user still sees the literal characters they typed');
+  ok('title with <, >, & escaped end-to-end — valid HTML, no injection, faithful text');
+
+  // -------------------------------------------------------------------------
   step('3. Admin commands refuse to render contributor data in a group');
   for (const cmd of ['/review', '/applicants 2', '/active', '/forget 300', '/status 1']) {
     mark = outbound.length;
@@ -166,21 +190,36 @@ async function main(): Promise<void> {
 
   // -------------------------------------------------------------------------
   step('3b. Group /open deep-links Apply into the DM (a callback would dead-end)');
-  mark = outbound.length;
-  await sayInGroup(CARA, '/open');
-  const groupCards = repliesTo(mark, GROUP).filter((o) => o.replyMarkup);
-  assert.ok(groupCards.length > 0, 'group /open rendered an applyable card');
-  for (const wired of groupCards.map((o) => JSON.stringify(o.replyMarkup))) {
-    assert.ok(wired.includes('https://t.me/DemoBot?start=t'), `group Apply is a deep link: ${wired}`);
-    assert.ok(!wired.includes('callback_data'), 'no callback Apply button in a group');
-  }
+  // /open is now a one-card paginator; page through every open task and collect
+  // each card's markup so the check doesn't depend on which task lands on page 0.
+  const openMarkups = async (user: number, chat?: Record<string, unknown>): Promise<string[]> => {
+    const at = chat ? GROUP : user;
+    let m = outbound.length;
+    if (chat) await sayIn(chat, user, '/open');
+    else await say(user, '/open');
+    const collected = [JSON.stringify(repliesTo(m, at).at(-1)?.replyMarkup ?? {})];
+    for (let p = 1; p < 3; p++) {
+      m = outbound.length;
+      await tap(user, `pg:open:0:${p}`, chat); // edits the same card to the next task
+      collected.push(JSON.stringify(repliesTo(m, at).at(-1)?.replyMarkup ?? {}));
+    }
+    return collected;
+  };
+  const groupMarkups = await openMarkups(CARA, groupChat);
+  assert.ok(groupMarkups.some((w) => w.includes('https://t.me/DemoBot?start=t')), 'a group open task showed a t.me deep-link Apply');
+  assert.ok(!groupMarkups.some((w) => /"callback_data":"apply:/.test(w)), 'no callback Apply button in any group card');
+  const dmMarkups = await openMarkups(CARA, undefined);
+  assert.ok(dmMarkups.some((w) => w.includes('"callback_data":"apply:')), 'private /open keeps the callback Apply button');
+  // In-place: Next edits the same card to a different task, not a new message.
   mark = outbound.length;
   await say(CARA, '/open');
-  const dmCard = repliesTo(mark, CARA).find((o) => o.replyMarkup);
-  assert.ok(
-    JSON.stringify(dmCard?.replyMarkup).includes('"callback_data":"apply:'),
-    'private /open keeps the callback button',
-  );
+  const firstCard = repliesTo(mark, CARA).at(-1)!;
+  mark = outbound.length;
+  await tap(CARA, 'pg:open:0:1');
+  const edits = since(mark).filter((o) => o.method === 'editMessageText' && o.chatId === CARA);
+  assert.equal(edits.length, 1, 'Next edits the card in place — one editMessageText, no new card');
+  assert.ok(edits[0].text !== firstCard.text, 'the paginator now shows a different task');
+  ok('paginator flips the card in place — no message spam');
   mark = outbound.length;
   await say(CARA, '/start t2');
   assert.ok(repliesTo(mark, CARA).some((o) => o.text.startsWith('Applying to #2')), 'deep link opens the apply wizard');
@@ -376,6 +415,34 @@ async function main(): Promise<void> {
   // Infrastructure backup/PITR is Railway's job, covered by the deploy docs'
   // operational restore drill — not by this in-process suite.
   ok(`schema_migrations at version ${SCHEMA_VERSION} (backup/restore is infra — see deploy docs)`);
+
+  // -------------------------------------------------------------------------
+  step('14. /start shows the inline home menu; a tap routes without a typed command');
+  mark = outbound.length;
+  await say(ALICE, '/start');
+  const welcome = repliesTo(mark, ALICE).at(-1)!;
+  const menu = JSON.stringify(welcome.replyMarkup ?? {});
+  assert.ok(menu.includes('home:open') && menu.includes('home:myapps') && menu.includes('home:settings'), 'home menu carries the nav buttons');
+  mark = outbound.length;
+  await tap(ALICE, 'home:myapps');
+  assert.ok(repliesTo(mark, ALICE).some((o) => o.text.includes('applied')), 'home:myapps rendered her application list — no command typed');
+  ok('home menu on /start; a button reaches My work with no command');
+
+  // -------------------------------------------------------------------------
+  step('15. Inline mode: @bot <query> returns shareable open tasks with an Apply deep link');
+  mark = outbound.length;
+  await inlineQuery(CARA, '');
+  const answered = since(mark).find((o) => o.method === 'answerInlineQuery');
+  assert.ok(answered && answered.results!.length > 0, 'inline query returned open-task results');
+  assert.ok(
+    answered!.results!.some((r) => JSON.stringify((r as { reply_markup?: unknown }).reply_markup ?? {}).includes('?start=t')),
+    'a shared card carries an Apply deep link',
+  );
+  assert.ok(
+    answered!.results!.every((r) => (r as { input_message_content?: { parse_mode?: string } }).input_message_content?.parse_mode === 'HTML'),
+    'shared messages render as HTML',
+  );
+  ok('inline search returns shareable open tasks with Apply deep links');
 
   // -------------------------------------------------------------------------
   step('Global invariants');

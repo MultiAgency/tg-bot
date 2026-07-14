@@ -52,21 +52,41 @@ task; use **Revise** (step 6) when you want another version instead.
   notification row addressed to or about them (queued or already delivered —
   rendered text carries their pitch and name).
 
+## Beyond the core loop (optional)
+
+- **Groups**: add the bot to a group — it becomes a *room* and the inviter its
+  first room admin. `/settings` (or `/enablesignals` / `/ai on`) toggles signal
+  detection and AI mode; each flip posts a public notice in the group. In an
+  AI-mode room, @mention the bot (or reply to it) to browse tasks and apply
+  conversationally — it only ever proposes cards a human still taps.
+- **Mini App**: with `WEB_PORT`/`PORT` and `WEB_APP_URL` set, the chat menu
+  button opens the read-mostly board (open tasks, your work, payouts); a NEAR
+  wallet links from the Payouts screen.
+- **Payouts**: approve a rewarded task, then admin `/payouts` shows the queue
+  and prints the treasury `allocate` command once the contributor linked a
+  wallet; re-run it after funding to see the row reconcile to "ready to claim".
+
 ## Known limitations (MVP)
 
 - Two admin tiers: everyone in `ADMIN_IDS` manages everything; room admins
   (added per group) manage their rooms' tasks. No finer role split within a tier.
 - Signal detection needs the bot to receive group texts — promote it to admin
   in the scanned group (recommended) or turn BotFather privacy mode off.
-- Rewards are free text; no payouts.
+- Rewards are free text. Approving rewarded work records a payout; `/payouts`
+  (admin) is the funding queue, settled through the NEAR claim escrow
+  (`contracts/escrow`) — the contributor links a wallet in the Mini App, the
+  treasury funds the allocation, and the contributor claims it from the Payouts
+  screen with their own wallet (one real-wallet pass in the Telegram webview
+  still pending).
 - Deadlines are informational text; nothing expires or reminds automatically.
 - Long-polling single instance; don't run two copies against one token.
 - AI notes cover text/link submissions and media captions (raw files, screenshots, and videos are passed through for human review).
 - Application cap (`MAX_OPEN_APPLICATIONS`, default 5 pending per contributor) is
   the only anti-spam guard; no rate limiting beyond it.
-- `/open` shows at most 15 task cards per invocation (Telegram sustains ~1
-  message/sec per chat); the rest are noted with a pointer to `/status` and the
-  announcement channel. No paging buttons yet.
+- `/open` is a single-card browser — flip tasks with ◀ ▶ (the card edits in
+  place), **Share** one into any chat via inline mode. Row-per-message lists
+  (`/myapps`, `/review`, `/payouts`) cap a page at 15 rows with a "showing
+  N of M" notice or a Next-page button.
 - Delivered/failed notification rows are pruned after 30 days (queued rows never
   are) — enough to debug delivery, without an unbounded archive.
 - New-task announcements go to the announcement channel (the primary discovery

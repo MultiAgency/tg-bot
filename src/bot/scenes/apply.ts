@@ -1,4 +1,4 @@
-import { Scenes } from 'telegraf';
+import { Scenes, Markup } from 'telegraf';
 import {
   type BotContext,
   SCENES,
@@ -36,7 +36,13 @@ export const applyScene = new Scenes.WizardScene<BotContext>(
     }
     // Truncated: a raw near-4096-char title would make this reply throw, and a
     // scene whose step-0 prompt never sends leaves the user trapped in the wizard.
-    await ctx.reply(t(L, 'apply.prompt', { id: task.id, title: truncate(task.title, 200) }));
+    await ctx.reply(
+      t(L, 'apply.prompt', { id: task.id, title: truncate(task.title, 200) }),
+      Markup.keyboard([[t(L, 'apply.skipButton')]])
+        .oneTime()
+        .resize()
+        .placeholder(t(L, 'apply.pitchPlaceholder')),
+    );
     return ctx.wizard.next();
   },
   // step 1 — record the pitch and apply
@@ -49,18 +55,19 @@ export const applyScene = new Scenes.WizardScene<BotContext>(
       return; // stay on this step
     }
     const taskId = wizardState(ctx).taskId!;
-    const pitch = text === '-' ? null : text;
+    // Skip via the button, or the legacy "-" typed convention.
+    const pitch = text === '-' || text === t(L, 'apply.skipButton') ? null : text;
     // Only the mutation is inside the try: once it commits, a failure in the
     // notify/reply below must surface in bot.catch, not as a false "failed".
     let app;
     try {
       app = await apply(taskId, ctx.from!.id, pitch);
     } catch (err) {
-      await ctx.reply(errorMessage(err, t(L, 'apply.fail')));
+      await ctx.reply(errorMessage(err, t(L, 'apply.fail')), Markup.removeKeyboard());
       return ctx.scene.leave();
     }
     await notifyAdminsOfApplication(app, await getTask(taskId)); // durable before any send can fail
-    await ctx.reply(t(L, 'apply.applied', { id: taskId }));
+    await ctx.reply(t(L, 'apply.applied', { id: taskId }), Markup.removeKeyboard());
     return ctx.scene.leave();
   },
 );

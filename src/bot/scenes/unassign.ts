@@ -9,7 +9,6 @@ import {
 } from '../context.js';
 import {
   getApplication,
-  getTask,
   latestSubmission,
   unassignApplication,
   errorMessage,
@@ -58,14 +57,15 @@ export const unassignScene = new Scenes.WizardScene<BotContext>(
     const applicationId = wizardState(ctx).applicationId!;
     // Only the mutation is inside the try: once it commits, a failure in the
     // notify/reply below must surface in bot.catch, not as a false "failed".
-    let app;
+    let result;
     try {
-      app = await unassignApplication(applicationId, ctx.from!.id, text);
+      result = await unassignApplication(applicationId, ctx.from!.id, text);
     } catch (err) {
       await ctx.reply(errorMessage(err, t(L, 'un.fail')));
       return ctx.scene.leave();
     }
-    await notifyApplicant(app, await getTask(app.task_id), 'unassigned', text);
+    const { application, task } = result;
+    await notifyApplicant(application, task, 'unassigned', text);
     await ctx.reply(t(L, 'un.done'));
     return ctx.scene.leave();
   },
