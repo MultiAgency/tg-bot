@@ -11,13 +11,9 @@
  * no port binding, no live Telegram.
  */
 import assert from 'node:assert';
-import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { createORPCClient } from '@orpc/client';
 import { RPCLink } from '@orpc/client/fetch';
 import type { RouterClient } from '@orpc/server';
-import { parseKey, Near } from 'near-kit';
-import { getAllocation, allocateCommand } from '../src/near/escrow.js';
 import { createWebApp } from '../src/web/server.js';
 import type { AppRouter } from '../src/web/api.js';
 import { signInitData, validateInitData } from '../src/web/auth.js';
@@ -67,6 +63,10 @@ async function main(): Promise<void> {
   const health = await app.request('/healthz');
   assert.equal(health.status, 200, 'healthz returns 200');
   assert.deepEqual(await health.json(), { ok: true, db: 'up' }, 'healthz reports the shared DB is up');
+  assert.ok(
+    (health.headers.get('content-security-policy') ?? '').includes("script-src 'self' https://telegram.org"),
+    'CSP header set (self + the telegram.org bridge only)',
+  );
   console.log('  ✅ /healthz → 200, shared DB pool reachable');
 
   // ---- initData auth ----
@@ -88,7 +88,16 @@ async function main(): Promise<void> {
     config.botToken,
   );
   assert.equal(validateInitData(withSig).user.id, ADA, 'signature field is hashed with the rest, not stripped');
-  console.log('  ✅ initData auth: valid accepted; absent / tampered / wrong-token → 401');
+  // Freshness: a correctly-signed payload is a bearer credential only within
+  // the replay window (1h) — pin the expiry branch via the injectable clock.
+  const hourAndABit = 3_700_000;
+  assert.throws(
+    () => validateInitData(adaInit, config.botToken, undefined, Date.now() + hourAndABit),
+    /expired/,
+    'a validly-signed but stale initData is rejected',
+  );
+  assert.equal(validateInitData(adaInit, config.botToken, undefined, Date.now() + 60_000).user.id, ADA, 'fresh initData still validates near the boundary');
+  console.log('  ✅ initData auth: valid accepted; absent / tampered / wrong-token / stale → 401');
 
   // ---- oRPC read API, through the real typed client ----
   const clientFor = (initData?: string): RouterClient<AppRouter> =>
@@ -126,124 +135,66 @@ async function main(): Promise<void> {
 
   // ---- payouts: recorded on approval, surfaced to the owed contributor only ----
   const payouts = await ada.myPayouts();
+  const paidRow = payouts.find((p) => p.taskId === paid.id);
   assert.ok(
-    payouts.some((p) => p.taskId === paid.id && p.reward === '50 USDC' && p.status === 'pending'),
+    paidRow?.reward === '50 USDC' && paidRow.status === 'pending',
     'approving rewarded work records a pending payout for the contributor',
   );
+  // The exact on-chain amount is null until /pay pins it — the UI surfaces this
+  // (not the free-text reward) once proposed/paid, so it must flow through here.
+  assert.equal(paidRow?.amountNear, null, 'a pending payout exposes amountNear = null');
+  // The verification-honesty fields: a never-claimed pending row costs no chain
+  // read, so it is verified-by-construction — ok true, held false. (The !ok and
+  // held render branches need a live/rpc-failing DAO and stay untestable here.)
+  assert.equal(paidRow?.ok, true, 'a never-claimed pending row reads verified (ok)');
+  assert.equal(paidRow?.held, false, 'and not held');
   assert.deepEqual(await ben.myPayouts(), [], 'payouts are caller-scoped (Ben is owed none)');
   console.log('  ✅ payout recorded on approval; myPayouts caller-scoped');
 
-  // ---- NEAR wallet link (real NEP-413 round trip against testnet) ----
-  // No wallet is linked yet.
-  const meBefore = (await (await app.request('/api/me', { headers: { Authorization: `tma ${adaInit}` } })).json()) as {
-    linkedNearAccount: string | null;
+  // ---- payout account: the ONLY web WRITE endpoint — auth-gated + validated ----
+  // No successful-set assertion here: setPayoutAccount's on-chain existence check
+  // is a live-NEAR path kept out of the deterministic gate. These pin the parts
+  // that must never regress silently — auth scope, the required-field 400, and the
+  // WorkflowError→400 mapping for a malformed account id (rejected before any RPC).
+  const postAccount = (initData: string | undefined, body: unknown) =>
+    app.request('/api/payout-account', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(initData ? { Authorization: `tma ${initData}` } : {}) },
+      body: JSON.stringify(body),
+    });
+  assert.equal((await postAccount(undefined, { account: 'ada.testnet' })).status, 401, 'payout-account write requires initData');
+  assert.equal((await postAccount(adaInit, {})).status, 400, 'missing account → 400 (account required)');
+  assert.equal(
+    (await postAccount(adaInit, { account: 'NOT a valid *acct*' })).status,
+    400,
+    'a malformed NEAR account id is rejected 400 before any on-chain check',
+  );
+  // The one write endpoint buffers its body in the bot's process — the 1 KB
+  // bodyLimit is what keeps an authenticated-but-anyone giant POST from being
+  // a memory lever. Any honest payload (a ≤64-char account) is far under it.
+  assert.equal(
+    (await postAccount(adaInit, { account: 'x'.repeat(4096) })).status,
+    413,
+    'an oversized body is refused (413) before it is buffered',
+  );
+  // The /rpc routes buffer their bodies the same way (oRPC reads the whole
+  // request before any zod schema runs) — same lever, same cap.
+  assert.equal(
+    (
+      await app.request('/rpc/openTasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `tma ${adaInit}` },
+        body: JSON.stringify({ junk: 'x'.repeat(64 * 1024) }),
+      })
+    ).status,
+    413,
+    'an oversized /rpc body is refused (413) before oRPC buffers it',
+  );
+  const meBody = (await (await app.request('/api/me', { headers: { Authorization: `tma ${adaInit}` } })).json()) as {
+    payoutAccount: string | null;
   };
-  assert.equal(meBefore.linkedNearAccount, null, 'no NEAR account linked initially');
-
-  const nonceRes = await app.request('/api/wallet/nonce', { method: 'POST', headers: { Authorization: `tma ${adaInit}` } });
-  const challenge = (await nonceRes.json()) as { nonce: string; message: string; recipient: string; network: string };
-  assert.ok(challenge.nonce && challenge.recipient === 'multiagency', 'nonce challenge issued');
-
-  // Sign the challenge with a REAL testnet account's key, then verify the whole
-  // proof (signature + on-chain full-access binding) through the link endpoint.
-  // Best-effort: skipped (not failed) if the testnet key or RPC isn't available,
-  // so the suite still runs offline.
-  const credPath = `${homedir()}/.near-credentials/testnet/webfoundry.testnet.json`;
-  let ranLink = false;
-  try {
-    const cred = JSON.parse(readFileSync(credPath, 'utf8')) as { account_id: string; private_key: string };
-    const kp = parseKey(cred.private_key);
-    const signed = kp.signNep413Message!(cred.account_id, {
-      message: challenge.message,
-      recipient: challenge.recipient,
-      nonce: new Uint8Array(Buffer.from(challenge.nonce, 'base64')),
-    });
-    const linkRes = await app.request('/api/wallet/link', {
-      method: 'POST',
-      headers: { Authorization: `tma ${adaInit}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ accountId: signed.accountId, publicKey: signed.publicKey, signature: signed.signature, nonce: challenge.nonce }),
-    });
-    assert.equal(linkRes.status, 200, 'a valid NEP-413 proof (verified against testnet) links the account');
-    const meAfter = (await (await app.request('/api/me', { headers: { Authorization: `tma ${adaInit}` } })).json()) as {
-      linkedNearAccount: string | null;
-    };
-    assert.equal(meAfter.linkedNearAccount, cred.account_id, '/api/me now shows the linked NEAR account');
-    ranLink = true;
-    console.log('  ✅ NEP-413 wallet link verified end-to-end against testnet (sig + full-access binding)');
-  } catch (err) {
-    console.log('  ⚠ wallet-link testnet round trip skipped:', err instanceof Error ? err.message : err);
-  }
-
-  // Negative (offline, deterministic): a tampered signature is rejected at the
-  // crypto step, before any network binding check.
-  {
-    const n = await (await app.request('/api/wallet/nonce', { method: 'POST', headers: { Authorization: `tma ${adaInit}` } })).json() as { nonce: string };
-    const bad = await app.request('/api/wallet/link', {
-      method: 'POST',
-      headers: { Authorization: `tma ${adaInit}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ accountId: 'webfoundry.testnet', publicKey: 'ed25519:11111111111111111111111111111111', signature: 'ed25519:2222222222222222222222222222222222222222222222222222222222222222', nonce: n.nonce }),
-    });
-    assert.equal(bad.status, 400, 'a forged signature is rejected');
-  }
-  console.log(`  ✅ wallet link: forged proof rejected${ranLink ? '' : ' (positive path skipped — offline)'}`);
-
-  // ---- escrow funding queue: command generation + on-chain allocation read ----
-  const cmd = allocateCommand(12, 'alice.testnet');
-  assert.match(cmd, /escrow\.agency\.testnet allocate/, 'allocate command targets the escrow');
-  assert.match(cmd, /"task_id":12,"account_id":"alice\.testnet"/, 'command carries the task + account');
-  assert.match(cmd, /<AMOUNT> NEAR/, 'amount is left for the treasury admin to set');
-  assert.match(cmd, /sign-as agency\.testnet/, 'signed by the treasury, not the bot');
-  // Real read against the live escrow: task 7 → webfoundry.testnet was allocated
-  // (and claimed) during the contract test, so its allocation is on-chain.
-  try {
-    const funded = await getAllocation(7, 'webfoundry.testnet');
-    assert.ok(funded && typeof funded.amount === 'string', 'getAllocation reads the live escrow allocation');
-    assert.equal(await getAllocation(999999, 'webfoundry.testnet'), null, 'unfunded (task, account) reads as null');
-    console.log('  ✅ escrow: allocate command generated; on-chain allocation read from the live contract');
-  } catch (err) {
-    console.log('  ⚠ escrow read skipped:', err instanceof Error ? err.message : err);
-  }
-
-  // ---- claim flow, key-backed, against the LIVE contract ----
-  // The exact operations the frontend performs (myPayouts claimable + a near-kit
-  // `call(escrow, 'claim')`), verified end to end: treasury allocates on-chain
-  // for Ada's rewarded payout → myPayouts flags it claimable → the contributor
-  // claims → the allocation is gone. Key-signed here; the frontend wallet.ts runs
-  // the identical near-kit `call`, wallet-signed. Runs only if the wallet link
-  // above linked Ada to webfoundry.testnet (ranLink).
-  if (ranLink) {
-    try {
-      const escrow = 'escrow.agency.testnet';
-      const treasuryKey = JSON.parse(
-        readFileSync(`${homedir()}/.near-credentials/testnet/agency.testnet.json`, 'utf8'),
-      ) as { private_key: string };
-      const wfKey = JSON.parse(readFileSync(credPath, 'utf8')) as { private_key: string };
-
-      // Treasury allocates for (Ada's payout task, webfoundry) unless a prior run left it funded.
-      if (!(await getAllocation(paid.id, 'webfoundry.testnet'))) {
-        const treasury = new Near({ network: 'testnet', keyStore: { 'agency.testnet': treasuryKey.private_key }, defaultSignerId: 'agency.testnet' });
-        await treasury.call(escrow, 'allocate', { task_id: paid.id, account_id: 'webfoundry.testnet' }, { attachedDeposit: '0.05 NEAR' });
-      }
-      // Poll until the allocation is readable (finality lag between the tx and the view).
-      let present = await getAllocation(paid.id, 'webfoundry.testnet');
-      for (let i = 0; i < 20 && !present; i++) {
-        await new Promise((r) => setTimeout(r, 500));
-        present = await getAllocation(paid.id, 'webfoundry.testnet');
-      }
-      assert.ok(present, 'the allocation is readable on-chain after allocate');
-      const claimable = (await ada.myPayouts()).find((p) => p.taskId === paid.id);
-      assert.ok(claimable?.claimable, 'myPayouts flags the on-chain-funded payout as claimable');
-
-      // Contributor claims via the same near-kit call path the frontend uses.
-      const contributor = new Near({ network: 'testnet', keyStore: { 'webfoundry.testnet': wfKey.private_key }, defaultSignerId: 'webfoundry.testnet' });
-      await contributor.call(escrow, 'claim', { task_id: paid.id });
-      assert.equal(await getAllocation(paid.id, 'webfoundry.testnet'), null, 'after claim the allocation is gone (paid out)');
-      assert.equal((await ada.myPayouts()).find((p) => p.taskId === paid.id)?.claimable, false, 'a claimed payout is no longer claimable');
-      console.log('  ✅ claim flow: allocate → myPayouts claimable → claim → gone (key-backed, live contract)');
-    } catch (err) {
-      console.log('  ⚠ claim flow skipped:', err instanceof Error ? err.message : err);
-    }
-  }
+  assert.equal(meBody.payoutAccount, null, '/api/me exposes the caller’s payoutAccount (null before any set)');
+  console.log('  ✅ /api/payout-account: initData-gated, account-required + format-validated');
 
   // ---- public config + the built Mini App is served ----
   const cfg = await app.request('/config');

@@ -10,6 +10,9 @@ export interface Contributor {
   completed_count: number;
   rejected_count: number;
   announce_opt_in: number;
+  /** [DAO] the contributor's standing NEAR payout account (typed, existence-checked
+   *  — not proof-backed); null until they set one. See migration 010. */
+  payout_account: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -35,6 +38,20 @@ export async function upsertContributor(
        updated_at    = EXCLUDED.updated_at`,
     [telegramId, username, displayName, languageCode, nowIso()],
   );
+}
+
+/** Set a contributor's standing DAO-push payout account (validated by the
+ *  service wrapper). Affects an existing row only — callers upsert first.
+ *  Returns whether a row matched: false means the contributor vanished between
+ *  the caller's upsert and this write (a concurrent /forget) — the caller must
+ *  surface that, not report a save that stored nothing. */
+export async function setPayoutAccount(telegramId: number, account: string): Promise<boolean> {
+  const n = await run('UPDATE contributors SET payout_account = $2, updated_at = $3 WHERE telegram_id = $1', [
+    telegramId,
+    account,
+    nowIso(),
+  ]);
+  return n > 0;
 }
 
 export async function getContributor(telegramId: number): Promise<Contributor | undefined> {
@@ -74,6 +91,9 @@ export async function setAnnounceOptIn(telegramId: number, on: boolean): Promise
     telegramId,
   ]);
 }
+
+export const countAll = async (): Promise<number> =>
+  (await one<{ n: number }>('SELECT COUNT(*) AS n FROM contributors'))!.n;
 
 /** Contributors who opted in to task-announcement DMs (the fan-out audience). */
 export function listAnnounceRecipients(): Promise<Contributor[]> {

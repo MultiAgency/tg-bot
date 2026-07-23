@@ -61,10 +61,11 @@ task; use **Revise** (step 6) when you want another version instead.
   conversationally — it only ever proposes cards a human still taps.
 - **Mini App**: with `WEB_PORT`/`PORT` and `WEB_APP_URL` set, the chat menu
   button opens the read-mostly board (open tasks, your work, payouts); a NEAR
-  wallet links from the Payouts screen.
-- **Payouts**: approve a rewarded task, then admin `/payouts` shows the queue
-  and prints the treasury `allocate` command once the contributor linked a
-  wallet; re-run it after funding to see the row reconcile to "ready to claim".
+  payout account is set from the Payouts screen.
+- **Payouts**: approve a rewarded task; the contributor sets a payout account
+  with `/payto <account>`. Admin `/payouts` shows the queue, and `/pay <taskId>
+  <amount>` proposes a DAO `Transfer` — the council approves it, and re-running
+  `/payouts` reconciles the row to `paid`.
 
 ## Known limitations (MVP)
 
@@ -72,17 +73,18 @@ task; use **Revise** (step 6) when you want another version instead.
   (added per group) manage their rooms' tasks. No finer role split within a tier.
 - Signal detection needs the bot to receive group texts — promote it to admin
   in the scanned group (recommended) or turn BotFather privacy mode off.
-- Rewards are free text. Approving rewarded work records a payout; `/payouts`
-  (admin) is the funding queue, settled through the NEAR claim escrow
-  (`contracts/escrow`) — the contributor links a wallet in the Mini App, the
-  treasury funds the allocation, and the contributor claims it from the Payouts
-  screen with their own wallet (one real-wallet pass in the Telegram webview
-  still pending).
+- Rewards are free text. Approving rewarded work records a payout row; settlement
+  is **push via a Sputnik DAO** (see `PAYOUTS.md`): an admin `/pay`s to propose a
+  `Transfer`, the council approves it, and the DAO executes the transfer. The
+  pilot can run with the DAO path off (no `DAO_CONTRACT_ID`) — payouts stay
+  recorded but unsettled.
 - Deadlines are informational text; nothing expires or reminds automatically.
 - Long-polling single instance; don't run two copies against one token.
 - AI notes cover text/link submissions and media captions (raw files, screenshots, and videos are passed through for human review).
-- Application cap (`MAX_OPEN_APPLICATIONS`, default 5 pending per contributor) is
-  the only anti-spam guard; no rate limiting beyond it.
+- Anti-abuse guards: the application cap (`MAX_OPEN_APPLICATIONS`, default 5
+  pending per contributor) plus per-room hourly AI budgets
+  (`SIGNAL_MAX_PER_HOUR`, `AGENT_MAX_PER_HOUR`) bounding what a flooded or
+  hostile group can spend. Nothing finer-grained than those.
 - `/open` is a single-card browser — flip tasks with ◀ ▶ (the card edits in
   place), **Share** one into any chat via inline mode. Row-per-message lists
   (`/myapps`, `/review`, `/payouts`) cap a page at 15 rows with a "showing

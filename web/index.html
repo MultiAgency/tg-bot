@@ -4,14 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
     <title>MultiAgency</title>
-    <!-- Telegram Mini App bridge: exposes window.Telegram.WebApp (initData, theme, haptics). -->
+    <!-- Empty favicon: the page lives in Telegram's webview (no tab icon), so this
+         only suppresses the browser's automatic /favicon.ico request (a 404). -->
+    <link rel="icon" href="data:," />
+    <!-- Telegram Mini App bridge: exposes window.Telegram.WebApp (initData, theme, haptics).
+         The one deliberate third-party load — the bridge must come from telegram.org.
+         Fonts are self-hosted (see styles.css) so no other host sees the user. -->
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap"
-      rel="stylesheet"
-    />
   </head>
   <body>
     <div id="root"></div>

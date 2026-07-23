@@ -190,6 +190,14 @@ export function createHarness(
     /** The same, sent in an arbitrary chat (group/supergroup tests). */
     sayIn: (chat: Record<string, unknown>, userId: number, text: string) =>
       message(userId, textFields(text), chat),
+    /** A FORWARDED group text (forward_origin set): `userId` relays someone
+     *  else's words — text that must never count as addressing the bot. */
+    sayForwardedIn: (chat: Record<string, unknown>, userId: number, text: string) =>
+      message(
+        userId,
+        { ...textFields(text), forward_origin: { type: 'hidden_user', sender_user_name: 'Someone', date: 0 } },
+        chat,
+      ),
     /** A group text replying to another member's message (reply-based room-admin commands). */
     sayInReplyTo: (chat: Record<string, unknown>, userId: number, text: string, targetId: number) =>
       message(
@@ -212,8 +220,17 @@ export function createHarness(
           new_chat_member: { user: botUser, status: newStatus },
         },
       } as never),
-    /** An inline-button tap on a bot card — in the user's private chat unless `chat` says otherwise. */
-    tap: async (userId: number, data: string, chat?: Record<string, unknown>) => {
+    /** An inline-button tap on a bot card — in the user's private chat unless `chat` says otherwise.
+     *  Like real Telegram, the callback carries the host message WITH its (server-attested)
+     *  keyboard — by default one containing the tapped button (a legit tap). Pass `hostKeyboard`
+     *  to model a FORGED callback: arbitrary `data` sent against a message whose real keyboard
+     *  never offered that button (handlers that edit the host message must refuse those). */
+    tap: async (
+      userId: number,
+      data: string,
+      chat?: Record<string, unknown>,
+      hostKeyboard?: Record<string, unknown>[][],
+    ) => {
       await bot.handleUpdate({
         update_id: updateId++,
         callback_query: {
@@ -227,6 +244,7 @@ export function createHarness(
             chat: chat ?? privateChat(userId),
             date: 0,
             text: 'card',
+            reply_markup: { inline_keyboard: hostKeyboard ?? [[{ text: 'card', callback_data: data }]] },
           },
         },
       } as never);

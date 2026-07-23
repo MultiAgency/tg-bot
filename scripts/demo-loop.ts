@@ -18,6 +18,8 @@ import {
   notificationCounts,
 } from '../src/core/service.js';
 import { drainNotifications } from '../src/bot/worker.js';
+import { nudgeStaleAssignments } from '../src/bot/notify.js';
+import { run } from '../src/core/db.js';
 import { aiEnabled } from '../src/ai/assist.js';
 import { runScript } from './run.js';
 import { resetDb } from './testdb.js';
@@ -161,7 +163,7 @@ async function main(): Promise<void> {
     'alice received the approval DM via the queue',
   );
   assert.ok(
-    outbound.some((o) => o.chatId === BOB && /rejected/i.test(o.text)),
+    outbound.some((o) => o.chatId === BOB && /wasn.t accepted/i.test(o.text)),
     'bob received the rejection DM via the queue',
   );
   assert.ok(
@@ -207,6 +209,80 @@ async function main(): Promise<void> {
   assert.ok(
     outbound.some((o) => o.method.startsWith('answerC') && /already has 2\/2 assignees/.test(o.text)),
     'assigning a 3rd to a full task was rejected with a popup',
+  );
+
+  step('10. Waiting-state notices: a filled last slot and a close reach the rest of the pool');
+  const makeTask = async (title: string, slots: string) => {
+    await say(ADMIN, '/newtask');
+    await say(ADMIN, title);
+    await say(ADMIN, 'x');
+    await say(ADMIN, '-');
+    await say(ADMIN, '-');
+    await say(ADMIN, '-');
+    await say(ADMIN, slots);
+    const draft = [...outbound].reverse().find((o) => o.chatId === ADMIN && /Draft created/i.test(o.text));
+    assert.ok(draft, `draft created for "${title}"`);
+  };
+  await makeTask('Filled-notice task', '1');
+  await tap(ADMIN, 'approve:2');
+  await tap(ALICE, 'apply:2');
+  await say(ALICE, 'me again');
+  await tap(BOB, 'apply:2');
+  await say(BOB, 'me too');
+  const aliceApp2 = (await getApplicationFor(2, ALICE))!.id;
+  await tap(ADMIN, `assign:${aliceApp2}`); // takes the ONLY slot → Bob's wait changed shape
+  await makeTask('Close-notice task', '1');
+  await tap(ADMIN, 'approve:3');
+  await tap(BOB, 'apply:3');
+  await say(BOB, 'on it');
+  await say(ADMIN, '/close 3');
+  await drainNotifications(bot.telegram);
+  assert.ok(
+    outbound.some((o) => o.chatId === BOB && /filled its last slot/.test(o.text)),
+    'bob (still applied) heard task 2 filled its last slot',
+  );
+  assert.ok(
+    outbound.some((o) => o.chatId === BOB && /closed before your application/.test(o.text)),
+    'bob heard task 3 closed under his undecided application',
+  );
+
+  step('11. Pre-stale nudge: an aging assignment warns the assignee before /unassign territory');
+  // Age Alice's task-2 assignment past the nudge threshold (staleDays−2 = 5)
+  // but not past staleness — the window the sweep exists for.
+  await run(`UPDATE applications SET updated_at = now() - interval '6 days' WHERE id = $1`, [aliceApp2]);
+  await nudgeStaleAssignments();
+  await drainNotifications(bot.telegram);
+  assert.ok(
+    outbound.some((o) => o.chatId === ALICE && /days ago and nothing has been submitted/.test(o.text)),
+    'alice received the pre-stale reminder',
+  );
+  const nudgesBefore = outbound.filter((o) => o.chatId === ALICE && /days ago and nothing/.test(o.text)).length;
+  await nudgeStaleAssignments(); // dedup: a second sweep must not re-nudge the same stint
+  await drainNotifications(bot.telegram);
+  assert.equal(
+    outbound.filter((o) => o.chatId === ALICE && /days ago and nothing/.test(o.text)).length,
+    nudgesBefore,
+    'a second sweep does not re-nudge the same assignment stint',
+  );
+
+  step('12. /stats and /diag: the funnel gauge and the config preflight');
+  await say(ADMIN, '/stats');
+  const stats = [...outbound].reverse().find((o) => o.chatId === ADMIN && /Product stats/.test(o.text));
+  assert.ok(stats, 'stats overview rendered');
+  assert.ok(/activation/.test(stats!.text), 'stats includes the activation rate');
+  await say(ADMIN, '/diag');
+  const diag = [...outbound].reverse().find((o) => o.chatId === ADMIN && /Diagnostics/.test(o.text));
+  assert.ok(diag, 'diagnostics rendered');
+  assert.ok(/Database reachable/.test(diag!.text), 'diag checked the database');
+  // (The announce-chat line depends on the runner's .env — not asserted.)
+
+  step('13. /forgetme: a contributor files their own erasure request');
+  await say(BOB, '/forgetme');
+  await tap(BOB, 'forgetme:yes');
+  await drainNotifications(bot.telegram);
+  assert.ok(
+    outbound.some((o) => o.chatId === ADMIN && /Erasure request from contributor/.test(o.text)),
+    'the admin was alerted with the id to run /forget',
   );
 
   console.log('\n✅ BOT DEMO PASSED — apply → assign (slots) → versioned submit → review → erasure.');

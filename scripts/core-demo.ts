@@ -6,6 +6,7 @@ import assert from 'node:assert';
 import {
   createTask,
   approveTask,
+  discardDraft,
   closeTask,
   apply,
   assignApplication,
@@ -28,11 +29,17 @@ import {
   listAnnounceRecipients,
   listApplicationsByContributor,
   listHistory,
+  draftTaskFromSignal,
   WorkflowError,
 } from '../src/core/service.js';
 import { enqueue, findByDedup, markSent } from '../src/core/models/notification.js';
+import { markProposed, markPaid } from '../src/core/models/payout.js';
+import { upsertRoom } from '../src/core/models/room.js';
+import { createEvaluating } from '../src/core/models/signal.js';
+import { one } from '../src/core/db.js';
 import { resetDb } from './testdb.js';
 import { runScript } from './run.js';
+import { seedPendingPayout } from './seed.js';
 
 const ADMIN = 1;
 const ALICE = 100;
@@ -184,6 +191,49 @@ async function main(): Promise<void> {
   assert.equal((await getTask(dblDraft.id))!.status, 'open', 'draft opened exactly once');
   assert.equal((await listHistory(dblDraft.id)).filter((h) => h.action === 'approved').length, 1, 'one approval in history');
 
+  // --- Discard: the draft's OTHER exit — delete, never publish-to-dismiss ---
+  // A draft may distill unreleased group chatter; rejecting it must not force an
+  // announcement, and must not leave the text parked. The row and its history go.
+  const junkDraft = await createTask({ title: 'Junk draft', description: 'x', createdBy: ADMIN });
+  const discarded = await discardDraft(junkDraft.id, ADMIN);
+  assert.equal(discarded.id, junkDraft.id);
+  assert.equal(await getTask(junkDraft.id), undefined, 'a discarded draft is deleted, not tombstoned');
+  assert.deepEqual(await listHistory(junkDraft.id), [], 'its history dies with it');
+  await assert.rejects(() => discardDraft(junkDraft.id, ADMIN), WorkflowError, 'double-discard is refused');
+  await assert.rejects(
+    () => discardDraft(dblDraft.id, ADMIN),
+    (err) => err instanceof WorkflowError && /only drafts/.test(err.message),
+    'an Open task (public footprint) can never be discarded',
+  );
+  // A SIGNAL-drafted junk draft: discarding it closes the signal out as
+  // 'discarded' (the room tally reports the pipeline's NET outcome), drops the
+  // FK pointer to the deleted row, and keeps the score (it measured the message).
+  const sigRoom = await upsertRoom(-777, 'Signal room');
+  const sigId = await createEvaluating(sigRoom.chat_id);
+  const { task: sigDraft } = await draftTaskFromSignal(
+    sigId,
+    sigRoom.chat_id,
+    { title: 'Signal junk', description: 'x', requiredOutput: null, deadline: null, maxAssignees: null },
+    7,
+  );
+  await discardDraft(sigDraft.id, ADMIN);
+  assert.equal(await getTask(sigDraft.id), undefined, 'the signal draft is gone');
+  const sigRow = await one<{ status: string; task_id: number | null; score: number }>(
+    'SELECT status, task_id, score FROM signals WHERE id = $1',
+    [sigId],
+  );
+  assert.deepEqual(sigRow, { status: 'discarded', task_id: null, score: 7 }, 'signal closed out as discarded, score kept');
+
+  // Two admins deciding the same draft: the row lock admits one; the loser
+  // surfaces "not found" / "not a draft" instead of double-applying.
+  const raceDraft = await createTask({ title: 'Decide race', description: 'x', createdBy: ADMIN });
+  const decideOutcomes = await Promise.allSettled([
+    discardDraft(raceDraft.id, ADMIN),
+    approveTask(raceDraft.id, ADMIN),
+  ]);
+  assert.equal(decideOutcomes.filter((o) => o.status === 'fulfilled').length, 1, 'exactly one decision won');
+  assert.equal(decideOutcomes.filter((o) => o.status === 'rejected').length, 1, 'the other was refused');
+
   // --- Concurrency: assign and decline race on the SAME application ---
   // The application-row lock admits one; the loser re-reads a status that is no
   // longer Applied and is rejected — without it the contributor could be DM'd
@@ -288,6 +338,24 @@ async function main(): Promise<void> {
   assert.equal((await getTask(drewTask.id))!.created_by, DREW);
   await forgetContributor(DREW, ADMIN);
   assert.equal((await getTask(drewTask.id))!.created_by, null, 'created_by nulled on erasure');
+
+  // --- Erasure yields to money: an OPEN DAO payout proposal blocks /forget ---
+  // (The chain preflight is DAO-gated — unset here; this pins the in-transaction
+  // backstop, which must hold even when DAO_CONTRACT_ID goes missing from the
+  // env: an open Transfer proposal is money the council can still send.)
+  const FAY = 600;
+  await upsertContributor(FAY, 'fay', 'Fay');
+  const fayPayout = await seedPendingPayout({ title: 'DAO-paid work', reward: '10 NEAR', admin: ADMIN, contributor: FAY });
+  await markProposed(fayPayout.id, null, 'fay.testnet', '1'); // Pay signed; proposal in flight on-chain (no id yet)
+  await assert.rejects(
+    () => forgetContributor(FAY, ADMIN),
+    (err) => err instanceof WorkflowError && err.message.includes('open DAO payout proposal'),
+    'erasure refused while a payout proposal is open',
+  );
+  assert.ok(await getContributor(FAY), 'the refused attempt erased nothing');
+  await markPaid(fayPayout.id); // the council approved; the DAO transferred
+  await forgetContributor(FAY, ADMIN);
+  assert.equal(await getContributor(FAY), undefined, 'a settled DAO payout no longer blocks erasure');
 
   // --- Erasure purges every notification addressed to OR about the contributor ---
   // Rendered text carries pitches/names and chat_id their Telegram id, so queued

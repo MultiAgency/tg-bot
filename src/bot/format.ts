@@ -53,9 +53,13 @@ export function esc(text: string): string {
 /**
  * Slice to at most `max` UTF-16 code units without leaving a dangling high
  * surrogate at the cut — an unpaired surrogate makes Telegram reject the whole
- * message ("strings must be encoded in UTF-8").
+ * message ("strings must be encoded in UTF-8"), and Node's UTF-8 encoder turns
+ * it into a stray U+FFFD in non-parsed fields (inline titles, button payloads).
+ * Exported for callers that need a plain prefix cut with NO ellipsis (e.g. a
+ * switch_inline_query payload that must stay a matchable prefix) — message text
+ * wants truncate() instead.
  */
-function safeSlice(text: string, max: number): string {
+export function safeSlice(text: string, max: number): string {
   let end = Math.min(max, text.length);
   const last = text.charCodeAt(end - 1);
   if (last >= 0xd800 && last <= 0xdbff) end -= 1;
@@ -77,7 +81,7 @@ function clampEscaped(escaped: string, max: number): string {
 }
 
 /** Escape and length-bound one piece of dynamic content for HTML composition. */
-function field(text: string, max: number): string {
+export function field(text: string, max: number): string {
   return clampEscaped(esc(text), max);
 }
 
@@ -94,6 +98,21 @@ const id = (n: number): string => `<code>${n}</code>`;
 /** Long dynamic content behind a collapsed, tap-to-expand quote. */
 const expandable = (s: string): string => `<blockquote expandable>${s}</blockquote>`;
 
+/** Names of the structural tags still open at the end of `html`, in nesting order. */
+function openTags(html: string): string[] {
+  const stack: string[] = [];
+  const re = /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)[^>]*>/g;
+  for (let m = re.exec(html); m; m = re.exec(html)) {
+    const name = m[2].toLowerCase();
+    if (m[1]) {
+      if (stack[stack.length - 1] === name) stack.pop();
+    } else {
+      stack.push(name);
+    }
+  }
+  return stack;
+}
+
 /**
  * Append closers for any structural tags still open in `html` (in reverse order),
  * so a fragment cut out of valid HTML is valid on its own. Without this a cut
@@ -101,17 +120,8 @@ const expandable = (s: string): string => `<blockquote expandable>${s}</blockquo
  * Telegram rejects the whole message with 400 "unclosed tag".
  */
 function closeOpenTags(html: string): string {
-  const stack: string[] = [];
-  const re = /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)[^>]*>/g;
-  for (let m = re.exec(html); m; m = re.exec(html)) {
-    const tag = m[2].toLowerCase();
-    if (m[1]) {
-      if (stack[stack.length - 1] === tag) stack.pop();
-    } else {
-      stack.push(tag);
-    }
-  }
   let out = html;
+  const stack = openTags(html);
   for (let i = stack.length - 1; i >= 0; i--) out += `</${stack[i]}>`;
   return out;
 }
@@ -276,17 +286,31 @@ export function fullSubmissionText(sub: Submission): string {
 }
 
 /**
- * Split escaped HTML into ≤4096-char pieces (Telegram's message cap) without
- * cutting a surrogate pair or a trailing entity — each piece is valid on its own.
- * Used for the "Full submission" path, whose escaped text can exceed one message.
+ * Split HTML into ≤4096-char pieces (Telegram's message cap) without cutting a
+ * surrogate pair, a trailing entity, or a tag mid-token — a piece ending in
+ * `&am` or `<cod` would 400. Each piece is a hard prefix of the remainder (no
+ * appended closers), so it can never overflow the cap.
+ *
+ * It does NOT split a balanced tag PAIR across pieces (a boundary between
+ * `<code>` and `</code>` would leave one piece with an unclosed tag). Both
+ * callers satisfy that by construction: `fullSubmissionText` is tag-free esc()
+ * output, and `/status` keeps its tags in the ≤2.7k head while the 4096 cut
+ * lands in the tag-free history tail. A future caller that needs to chunk
+ * arbitrarily-nested HTML must balance pieces itself — this deliberately does
+ * not carry the fragile close-and-reopen machinery to do it generically.
  */
 export function chunkMessage(text: string): string[] {
   const parts: string[] = [];
   let rest = text;
   while (rest.length > 4096) {
     let head = safeSlice(rest, 4096);
+    if (head.lastIndexOf('<') > head.lastIndexOf('>')) head = head.slice(0, head.lastIndexOf('<')); // half-cut tag
     const amp = head.lastIndexOf('&');
     if (amp > head.lastIndexOf(';')) head = head.slice(0, amp); // don't split an entity across parts
+    // No safe break in 4096 chars (a single oversized tag/entity) — take a hard
+    // surrogate-safe cut rather than stall. head is then always non-empty, so
+    // `rest` strictly shrinks and the loop terminates on any input.
+    if (head.length === 0) head = safeSlice(rest, 4096);
     parts.push(head);
     rest = rest.slice(head.length);
   }

@@ -1,0 +1,15 @@
+-- 016_drop_payout_superseded_claims.sql
+-- Removes the watched superseded-claims set that 015 created. Its motivating
+-- hazard was the printed CLI `add_proposal` fallback: a replayable command that
+-- never expired, so a payout's superseded destination identity had to be
+-- watched FOREVER. That fallback was removed at the root (the OutLayer TEE
+-- wallet is the bot's single proposer path), which bounds an un-landed claim
+-- by NEAR transaction validity (~a day) — so:
+--   - claim memory now EXPIRES after CLAIM_MEMORY_TTL_MS (48h, 2x the bound)
+--     once a complete scan proves nothing landed (see reconcilePayout);
+--   - /pay REFUSES a destination change while the earlier claim is unresolved
+--     (a bounded wait), instead of tracking a second identity here.
+-- A prior-identity proposal that lands within the bound is adopted or refused
+-- by the existing identity scans; one that first lands after erasure is the
+-- same council verify-before-vote residual the current claim has always had.
+DROP TABLE IF EXISTS payout_superseded_claims;

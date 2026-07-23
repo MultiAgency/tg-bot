@@ -1,0 +1,21 @@
+-- 017_hot_path_indexes.sql
+-- Two indexes for per-message / per-tick hot paths that otherwise degrade as
+-- their tables grow:
+--
+--   - signals (created_at): claimSignalSlot's GLOBAL hourly cap runs
+--     COUNT(*) WHERE created_at >= $1 on every candidate group message, inside
+--     the transaction holding the room row's FOR UPDATE lock. The only prior
+--     index leads on room_chat_id, so that count is a full scan of a table
+--     that only grows (signal rows are the per-room audit/tally and are never
+--     pruned) — the busiest lock in the product paying an ever-increasing toll.
+--
+--   - notifications (chat_id, id) WHERE status = 'queued': claimDue's
+--     structural per-chat FIFO anti-join ("does an earlier queued row exist
+--     for this chat?") probes once per due candidate on every worker pass.
+--     Via the existing (status, next_attempt_at) index that probe scans the
+--     whole queued set — O(queued²) row visits per drain pass exactly during
+--     a launch-scale announcement fan-out, repeated pass after pass until the
+--     backlog clears. The partial index makes it one probe per candidate and
+--     stays near-empty in steady state (delivered rows leave 'queued').
+CREATE INDEX idx_signals_created ON signals (created_at);
+CREATE INDEX idx_notifications_chat_queued ON notifications (chat_id, id) WHERE status = 'queued';

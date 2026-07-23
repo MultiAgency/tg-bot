@@ -68,6 +68,10 @@ export const listByApplication = (applicationId: number): Promise<Submission[]> 
 export const listByStatus = (status: SubmissionStatus): Promise<Submission[]> =>
   many<Submission>('SELECT * FROM submissions WHERE status = $1 ORDER BY created_at ASC, id ASC', [status]);
 
+export const oldestByStatus = async (status: SubmissionStatus): Promise<string | null> =>
+  (await one<{ oldest: string | null }>('SELECT MIN(created_at) AS oldest FROM submissions WHERE status = $1', [
+    status,
+  ]))!.oldest;
 export const countByStatus = async (status: SubmissionStatus): Promise<number> =>
   (await one<{ n: number }>('SELECT COUNT(*) AS n FROM submissions WHERE status = $1', [status]))!.n;
 

@@ -1,5 +1,5 @@
 import { one, many, run, nowIso } from '../db.js';
-import { ApplicationStatus } from '../workflow.js';
+import { ApplicationStatus, SubmissionStatus } from '../workflow.js';
 
 export interface Application {
   id: number;
@@ -93,6 +93,46 @@ export const countByTaskStatusesForTasks = (
   );
 export const countByStatusAll = async (status: ApplicationStatus): Promise<number> =>
   (await one<{ n: number }>('SELECT COUNT(*) AS n FROM applications WHERE status = $1', [status]))!.n;
+export const countAll = async (): Promise<number> =>
+  (await one<{ n: number }>('SELECT COUNT(*) AS n FROM applications'))!.n;
+export const countDistinctApplicants = async (): Promise<number> =>
+  (await one<{ n: number }>('SELECT COUNT(DISTINCT contributor_id) AS n FROM applications'))!.n;
+
+/**
+ * Assignments that look abandoned: still Assigned, untouched since `cutoffIso`,
+ * with nothing awaiting review and no submission activity since the cutoff —
+ * the claim-and-abandon surface /admin points at (/active lists them stalest
+ * first, /unassign frees the slot). An assignment whose latest version is
+ * Submitted is a REVIEWER's queue, not the contributor's, so it never counts.
+ */
+export const countStaleAssigned = async (cutoffIso: string): Promise<number> =>
+  (await one<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM applications a
+     WHERE a.status = $1 AND a.updated_at < $2
+       AND NOT EXISTS (
+         SELECT 1 FROM submissions s
+         WHERE s.application_id = a.id AND (s.status = $3 OR s.created_at >= $2)
+       )`,
+    [ApplicationStatus.Assigned, cutoffIso, SubmissionStatus.Submitted],
+  ))!.n;
+export const listStaleAssigned = (cutoffIso: string): Promise<Application[]> =>
+  many<Application>(
+    `SELECT a.* FROM applications a
+     WHERE a.status = $1 AND a.updated_at < $2
+       AND NOT EXISTS (
+         SELECT 1 FROM submissions s
+         WHERE s.application_id = a.id AND (s.status = $3 OR s.created_at >= $2)
+       )
+     ORDER BY a.updated_at ASC`,
+    [ApplicationStatus.Assigned, cutoffIso, SubmissionStatus.Submitted],
+  );
+/** When the oldest row ENTERED `status` — updated_at, not created_at: reapply()
+ *  returns a declined/withdrawn row to Applied without touching created_at, so
+ *  created_at would report a fresh re-application as a 60-day-old wait. */
+export const oldestByStatus = async (status: ApplicationStatus): Promise<string | null> =>
+  (await one<{ oldest: string | null }>('SELECT MIN(updated_at) AS oldest FROM applications WHERE status = $1', [
+    status,
+  ]))!.oldest;
 export const countByStatusPerTask = (status: ApplicationStatus): Promise<{ task_id: number; n: number }[]> =>
   many<{ task_id: number; n: number }>(
     'SELECT task_id, COUNT(*) AS n FROM applications WHERE status = $1 GROUP BY task_id ORDER BY task_id ASC',

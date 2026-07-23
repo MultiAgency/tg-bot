@@ -4,7 +4,34 @@
  * adapts to each user's light/dark, but carries a distinct voice: a Fraunces
  * display serif for titles, JetBrains Mono for the numeric ledger (ids, rewards,
  * deadlines), hairline rules between task "entries", and one staggered reveal.
+ *
+ * Fonts are SELF-HOSTED (variable woff2, latin subset, ~128 KB total — Vite
+ * hashes and bundles them): no fonts.googleapis.com request carrying the user's
+ * IP from a product that is careful about its privacy story, and no blank-text
+ * flash on a flaky mobile connection inside the webview.
  */
+
+@font-face {
+  font-family: 'Fraunces';
+  src: url('./fonts/fraunces-latin.woff2') format('woff2');
+  font-weight: 400 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Instrument Sans';
+  src: url('./fonts/instrument-sans-latin.woff2') format('woff2');
+  font-weight: 400 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('./fonts/jetbrains-mono-latin.woff2') format('woff2');
+  font-weight: 400 600;
+  font-style: normal;
+  font-display: swap;
+}
 
 :root {
   /* Telegram theme, with a warm-paper light fallback for out-of-Telegram dev. */
@@ -325,23 +352,23 @@ body {
 }
 
 /* ---- Wallet (Payouts screen) ---- */
-.wallet {
+.payout-account {
   margin: 16px 0 8px;
   padding: 14px;
   border: 1px solid var(--rule);
   border-radius: var(--radius);
   background: var(--surface);
 }
-.wallet-row {
+.payout-account-row {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
 }
-.wallet .dim {
+.payout-account .dim {
   margin: 0 0 6px;
 }
-.wallet .disclosure {
+.payout-account .disclosure {
   font-size: 12px;
   line-height: 1.45;
   color: var(--hint);
@@ -355,7 +382,7 @@ body {
   color: var(--accent);
   word-break: break-all;
 }
-.wallet-err {
+.payout-account-err {
   color: var(--danger);
   font-size: 13px;
   margin: 6px 2px 0;

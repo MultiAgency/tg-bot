@@ -5,14 +5,18 @@ import {
   messageText,
   wizardState,
   handledWizardInterrupt,
+  finishScene,
   requirePrivateChat,
 } from '../context.js';
 import {
   getApplication,
+  getTask,
   latestSubmission,
   unassignApplication,
   errorMessage,
 } from '../../core/service.js';
+import { leaveUnlessTaskManager } from './guards.js';
+import { withTransaction } from '../../core/db.js';
 import { ApplicationStatus, SubmissionStatus } from '../../core/workflow.js';
 import { notifyApplicant } from '../notify.js';
 import { t, localeOf } from '../i18n.js';
@@ -55,18 +59,29 @@ export const unassignScene = new Scenes.WizardScene<BotContext>(
       return; // stay on this step — a reason is required
     }
     const applicationId = wizardState(ctx).applicationId!;
-    // Only the mutation is inside the try: once it commits, a failure in the
-    // notify/reply below must surface in bot.catch, not as a false "failed".
-    let result;
-    try {
-      result = await unassignApplication(applicationId, ctx.from!.id, text);
-    } catch (err) {
-      await ctx.reply(errorMessage(err, t(L, 'un.fail')));
+    // Commit-time manager re-check (leaveUnlessTaskManager — shared with the
+    // review-note wizard): a demotion mid-wizard must not still unassign.
+    const app = await getApplication(applicationId);
+    if (!app) {
+      await ctx.reply(t(L, 'un.notFound'));
       return ctx.scene.leave();
     }
-    const { application, task } = result;
-    await notifyApplicant(application, task, 'unassigned', text);
-    await ctx.reply(t(L, 'un.done'));
-    return ctx.scene.leave();
+    const task = await getTask(app.task_id);
+    if (!(await leaveUnlessTaskManager(ctx, task))) return;
+    // The unassign and its outcome DM commit together: the DM is one-shot (a
+    // retry throws "not assigned", so its dedup key is never revisited) —
+    // enqueued after the commit, a crash between the two would lose it
+    // permanently. A failure rolls both back; the admin just retries.
+    // finishScene owns reply-and-leave on every path.
+    return finishScene(
+      ctx,
+      () =>
+        withTransaction(async () => {
+          const { application, task } = await unassignApplication(applicationId, ctx.from!.id, text);
+          await notifyApplicant(application, task, 'unassigned', text);
+        }),
+      () => ctx.reply(t(L, 'un.done')),
+      (err) => ctx.reply(errorMessage(err, t(L, 'un.fail'))),
+    );
   },
 );

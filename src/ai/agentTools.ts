@@ -15,7 +15,7 @@ import {
 import { clampSlots } from './assist.js';
 import type { Task } from '../core/models/task.js';
 import { taskDetail } from '../bot/format.js';
-import { approveButton, applyAffordanceBtn } from '../bot/keyboards.js';
+import { draftButtons, applyAffordanceBtn } from '../bot/keyboards.js';
 
 /**
  * Tools for the conversational agent (group /ai mode). The design rule mirrors
@@ -114,6 +114,9 @@ export const AGENT_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 
 type ToolResult = Record<string, unknown>;
 
+/** One "page" of the board per tool call — see the list_open_tasks case. */
+const OPEN_TASKS_CAP = 25;
+
 function brief(task: { id: number; title: string; status: string; reward: string | null; deadline: string | null }): ToolResult {
   return { id: task.id, title: task.title, status: task.status, reward: task.reward, deadline: task.deadline };
 }
@@ -154,27 +157,59 @@ async function runTool(env: AgentEnv, name: string, input: Record<string, unknow
     case 'list_open_tasks': {
       // Slot-annotated (the shared open-board read) so the agent can tell an
       // applyable task from one that's open-but-full — the same distinction
-      // /open draws when it labels a task "Fully assigned".
-      const rows = await listOpenTasksWithSlots();
-      return {
-        tasks: rows.map(({ task, assigned }) => ({
+      // /open draws when it labels a task "Fully assigned". Room-scoped like the
+      // in-group /open: this room's tasks plus the global board (a room task
+      // never leaves its room — see service.listOpenTasks). Capped: the board
+      // grows without bound, but every remaining tool round replays this result
+      // as input tokens — humans get pagination (/open), the agent gets one
+      // page and an honest count.
+      const rows = await listOpenTasksWithSlots(env.roomChatId);
+      const shown = rows.slice(0, OPEN_TASKS_CAP);
+      const result: ToolResult = {
+        tasks: shown.map(({ task, assigned }) => ({
           ...brief(task),
           assigned,
           slots: task.max_assignees,
           full: assigned >= task.max_assignees,
         })),
       };
+      if (rows.length > shown.length) {
+        result.note = `Showing the first ${shown.length} of ${rows.length} open tasks — ask about a specific task, or point the user at /open to browse the rest.`;
+      }
+      return result;
     }
 
     case 'get_task': {
       const task = await getTask(Number(input.taskId));
       if (!visibleTask(env, task)) return { error: `Task #${input.taskId} not found (or not visible here).` };
+      // A room's manager may learn a draft EXISTS (they were notified of it),
+      // but its BODY never leaves this tool: a draft can distill unapproved —
+      // possibly signal-drafted — group chatter, every classic surface reviews
+      // drafts in a DM (/approve is private-chat-gated), and whatever this tool
+      // returns the model may speak into the group chat it runs in.
+      if (!isTaskPublic(task)) {
+        return {
+          task: { id: task.id, status: task.status },
+          note: 'Draft content is reviewed privately — the admin sees the full draft via /approve in a DM with the bot.',
+        };
+      }
       const assigned = await countSlotsTaken(task.id);
       return { task: { ...brief(task), description: task.description, requiredOutput: task.required_output, assigned, slots: task.max_assignees } };
     }
 
     case 'list_my_applications': {
       const rows = await applicationsWithContext(env.userId);
+      // Own application statuses are DM-only on the classic surface (/myapps is
+      // private-chat-gated: rejections announced in front of a room don't belong
+      // there) — and whatever this tool returns the model may speak into the
+      // group chat it runs in (the same contract get_task's draft guard keeps).
+      // In a group, hand back only the count and the private entry point.
+      if (env.isGroup) {
+        return {
+          total: rows.length,
+          note: 'Application details are private — the contributor sees statuses via /myapps in a DM with the bot.',
+        };
+      }
       return {
         applications: rows.map(({ application, task }) => ({
           taskId: application.task_id,
@@ -202,7 +237,16 @@ async function runTool(env: AgentEnv, name: string, input: Record<string, unknow
         createdBy: env.userId,
         roomChatId: env.roomChatId,
       });
-      await env.reply(taskDetail(task, 0), approveButton(task, env.locale));
+      // The draft is committed; a failed card SEND must not read as "nothing
+      // happened" — the model would tell the admin it failed, they'd retry, and
+      // a duplicate draft lands in /approve. Report the commit truthfully.
+      try {
+        await env.reply(taskDetail(task, 0), draftButtons(task, env.locale));
+      } catch {
+        return {
+          result: `Drafted task #${task.id}, but the Approve card could not be shown here — the admin can review and approve it via /approve in a DM with the bot.`,
+        };
+      }
       return { result: `Drafted task #${task.id}; an Approve card was shown. The admin must tap Approve to open it.` };
     }
 
@@ -219,7 +263,18 @@ async function runTool(env: AgentEnv, name: string, input: Record<string, unknow
         countPendingApplications(env.userId),
       ]);
       const refusal = applyRefusal(task, assigned, existing, pending);
-      if (refusal) return { error: refusal };
+      if (refusal) {
+        // In a group, a PERSONAL refusal must not be relayed verbatim: its
+        // wording encodes the caller's own state ("already applied", "was
+        // rejected", the open-application cap) — the detail /myapps and the
+        // list_my_applications branch above deliberately keep in DMs. The
+        // refusal itself declares its audience (ApplyRefusal.personal); this
+        // layer just routes.
+        if (env.isGroup && refusal.personal) {
+          return { error: `You can't apply to task #${task.id} right now — see /myapps in a DM with the bot for details.` };
+        }
+        return { error: refusal.message };
+      }
       // Same placement rule as the /open paginator (applyAffordanceBtn): a card
       // with no button in a group with no known @username, never a dead-end tap.
       const btn = applyAffordanceBtn(task, !env.isGroup, config.botUsername, env.locale);

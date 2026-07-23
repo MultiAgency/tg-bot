@@ -30,7 +30,11 @@ export interface InitData {
 export function validateInitData(
   initData: string,
   botToken: string = config.botToken,
-  maxAgeSec = 86_400,
+  // A validated initData string is a bearer credential for its user until this
+  // lapses — Telegram mints a FRESH one on every Mini App open, so a tight
+  // window costs no UX and shrinks how long a leaked string (a pasted localhost
+  // preview URL, a request log) stays replayable.
+  maxAgeSec = 3_600,
   now: number = Date.now(),
 ): InitData {
   const params = new URLSearchParams(initData);

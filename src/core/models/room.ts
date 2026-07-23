@@ -58,6 +58,42 @@ export async function setAiEnabled(chatId: number, enabled: boolean): Promise<Ro
   ))!;
 }
 
+// ---- group → supergroup migration (service.migrateRoomChat orchestrates) ----
+// rooms.chat_id is the FK target of room_admins, signals, and tasks, none of
+// which cascade on update — so a chat-id change is copy-parent → move-children
+// → drop-old, all inside the caller's transaction.
+
+/** Copy the room row to its successor chat id (merge if the successor row
+ *  already exists — the OLD row carries the real opt-ins, so its flags win). */
+export async function copyRoomTo(oldChatId: number, newChatId: number): Promise<void> {
+  await run(
+    `INSERT INTO rooms (chat_id, title, signals_enabled, ai_enabled, created_at, updated_at)
+     SELECT $1, title, signals_enabled, ai_enabled, created_at, $3 FROM rooms WHERE chat_id = $2
+     ON CONFLICT (chat_id) DO UPDATE SET
+       title = COALESCE(EXCLUDED.title, rooms.title),
+       signals_enabled = EXCLUDED.signals_enabled,
+       ai_enabled = EXCLUDED.ai_enabled,
+       updated_at = EXCLUDED.updated_at`,
+    [newChatId, oldChatId, nowIso()],
+  );
+}
+
+/** Re-point the old room's admins at the successor id (dropping any that the
+ *  successor somehow already has, so the composite PK can't collide). */
+export async function moveAdmins(oldChatId: number, newChatId: number): Promise<void> {
+  await run(
+    `DELETE FROM room_admins WHERE room_chat_id = $1
+       AND telegram_id IN (SELECT telegram_id FROM room_admins WHERE room_chat_id = $2)`,
+    [oldChatId, newChatId],
+  );
+  await run('UPDATE room_admins SET room_chat_id = $1 WHERE room_chat_id = $2', [newChatId, oldChatId]);
+}
+
+/** Drop the retired room row — callable only once its children have moved. */
+export async function dropRoom(chatId: number): Promise<void> {
+  await run('DELETE FROM rooms WHERE chat_id = $1', [chatId]);
+}
+
 // ---- room admins ----
 
 /** Idempotent: returns true if the admin was newly added, false if already one. */

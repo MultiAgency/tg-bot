@@ -1,4 +1,4 @@
-import type { Scenes } from 'telegraf';
+import { Markup, type Scenes } from 'telegraf';
 import { config } from '../config.js';
 import { t, localeOf } from './i18n.js';
 
@@ -75,7 +75,7 @@ export function parseId(raw: string | undefined): number | null {
 export async function handledWizardInterrupt(
   ctx: BotContext,
   text: string | null,
-  opts: { allow?: string[] } = {},
+  opts: { allowAi?: boolean } = {},
 ): Promise<boolean> {
   const L = localeOf(ctx);
   if (ctx.callbackQuery) {
@@ -83,11 +83,15 @@ export async function handledWizardInterrupt(
     return true;
   }
   if (isCommand(text, 'cancel')) {
-    await ctx.reply(t(L, 'common.cancelled'));
+    // removeKeyboard, like the scenes' own exits: a wizard step may have posted
+    // a one-time reply keyboard ("⏭ Apply without a pitch"); left in place, its
+    // tap after the scene died sends literal text that gets no answer.
+    await ctx.reply(t(L, 'common.cancelled'), Markup.removeKeyboard());
     await ctx.scene.leave();
     return true;
   }
-  if (looksLikeCommand(text) && !(opts.allow ?? []).some((name) => isCommand(text, name))) {
+  // /ai is the one command a step may let through (the AI-drafting wizard steps).
+  if (looksLikeCommand(text) && !(opts.allowAi && isCommand(text, 'ai'))) {
     await ctx.reply(t(L, 'wizard.commandsPaused'));
     return true;
   }
@@ -114,6 +118,31 @@ export function safeAnswerCb(
 /** Typed view of the wizard's scratch state. Scene-enter params land here too — scene state IS the wizard state. */
 export function wizardState(ctx: BotContext): WizardState {
   return ctx.wizard.state as WizardState;
+}
+
+/**
+ * The final step of a wizard: run the mutation, reply, LEAVE — on every path.
+ * A throw must still reply and leave, or the admin is silently stranded in the
+ * wizard (their next command eaten until they guess /cancel); and once the
+ * mutation committed, a failed confirmation send (429 window) must still leave —
+ * staying invites a "retry" that duplicates the committed work. Both replies
+ * are best-effort for exactly those reasons.
+ */
+export async function finishScene<T>(
+  ctx: BotContext,
+  mutate: () => Promise<T>,
+  okReply: (result: T) => Promise<unknown>,
+  failReply: (err: unknown) => Promise<unknown>,
+): Promise<unknown> {
+  let result: T;
+  try {
+    result = await mutate();
+  } catch (err) {
+    await failReply(err).catch(() => undefined);
+    return ctx.scene.leave();
+  }
+  await okReply(result).catch(() => undefined);
+  return ctx.scene.leave();
 }
 
 /**

@@ -18,24 +18,30 @@ export const api: RouterClient<AppRouter> = createORPCClient(link);
 
 export interface AppConfig {
   botUsername: string;
-  nearNetwork: string;
-  escrowContractId: string;
+  daoContractId: string;
 }
 
 let configPromise: Promise<AppConfig> | undefined;
 
-/** Public app config (bot username for deep links + NEAR escrow coordinates for
- *  claims). Static for the session, so the fetch runs once and every later call
- *  (each TaskDetail mount, the Claim screen) shares the resolved promise. */
+/** Public app config (bot username for deep links + the DAO contract id the
+ *  Payouts screen keys off). Static for the session, so one SUCCESSFUL fetch is
+ *  shared by every later call (each TaskDetail mount, the Payouts screen). A
+ *  failure — e.g. opening the app during a deploy's few seconds of downtime —
+ *  returns the fallback but clears the memo, so the next mount retries instead
+ *  of hiding the payout-account UI for the rest of the session. */
 export function fetchConfig(): Promise<AppConfig> {
   return (configPromise ??= (async () => {
-    const fallback: AppConfig = { botUsername: '', nearNetwork: 'testnet', escrowContractId: '' };
+    const fallback: AppConfig = { botUsername: '', daoContractId: '' };
     try {
-      const res = await fetch('/config');
-      return res.ok ? { ...fallback, ...((await res.json()) as Partial<AppConfig>) } : fallback;
+      // Bounded: a server that accepts and hangs (mid-deploy LB) would otherwise
+      // pin the memo on a never-settling promise, beyond the clear-on-failure.
+      const res = await fetch('/config', { signal: AbortSignal.timeout(10_000) });
+      if (res.ok) return { ...fallback, ...((await res.json()) as Partial<AppConfig>) };
     } catch {
-      return fallback;
+      // fall through to the retry-able fallback
     }
+    configPromise = undefined;
+    return fallback;
   })());
 }
 
@@ -44,12 +50,22 @@ export async function fetchBotUsername(): Promise<string> {
   return (await fetchConfig()).botUsername;
 }
 
-/** The caller's linked NEAR account, or null when none is linked — read from the
- *  authenticated /api/me. A failed read THROWS (surfaced by useAsync as an error
- *  state) instead of masquerading as "not linked", which would show a Connect
- *  CTA to an already-linked user. */
-export async function fetchLinkedAccount(): Promise<string | null> {
+/** The caller's saved DAO-push payout account (typed, existence-checked), or null. */
+export async function fetchPayoutAccount(): Promise<string | null> {
   const res = await fetch('/api/me', { headers: { Authorization: `tma ${initData}` } });
-  if (!res.ok) throw new Error(`couldn't check your wallet link (${res.status})`);
-  return ((await res.json()) as { linkedNearAccount: string | null }).linkedNearAccount;
+  if (!res.ok) throw new Error(`couldn't load your payout account (${res.status})`);
+  return ((await res.json()) as { payoutAccount: string | null }).payoutAccount;
+}
+
+/** Save the caller's DAO-push payout account. The server validates it exists
+ *  on-chain (typed accounts carry no proof); a 400 carries a user-safe message. */
+export async function savePayoutAccount(account: string): Promise<string> {
+  const res = await fetch('/api/payout-account', {
+    method: 'POST',
+    headers: { Authorization: `tma ${initData}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ account }),
+  });
+  const json = (await res.json().catch(() => ({}))) as { payoutAccount?: string; error?: string };
+  if (!res.ok || !json.payoutAccount) throw new Error(json.error ?? `couldn't save your payout account (${res.status})`);
+  return json.payoutAccount;
 }

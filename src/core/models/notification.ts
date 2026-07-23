@@ -120,10 +120,24 @@ export async function enqueueMany(rows: NewNotification[]): Promise<number> {
   });
 }
 
-/** Queued notifications whose backoff has elapsed (oldest first), for delivery. */
+/**
+ * Queued notifications whose backoff has elapsed (oldest first), for delivery.
+ * The NOT EXISTS clause makes per-recipient FIFO structural: a chat's earliest
+ * still-queued row is the only claimable one, so a head that is backing off (or
+ * was enqueued moments ago) blocks its later siblings — including rows enqueued
+ * AFTER the head deferred, which an event-driven defer-on-retry could never
+ * reach. At most one row per chat is claimed per pass; the table is pruned to
+ * ~30 days, so the self-anti-join stays cheap.
+ */
 export function claimDue(now: string, limit: number): Promise<NotificationRow[]> {
   return many<NotificationRow>(
-    `SELECT * FROM notifications WHERE status = 'queued' AND next_attempt_at <= $1 ORDER BY id LIMIT $2`,
+    `SELECT * FROM notifications n
+     WHERE n.status = 'queued' AND n.next_attempt_at <= $1
+       AND NOT EXISTS (
+         SELECT 1 FROM notifications p
+         WHERE p.chat_id = n.chat_id AND p.status = 'queued' AND p.id < n.id
+       )
+     ORDER BY n.id LIMIT $2`,
     [now, limit],
   );
 }
@@ -156,19 +170,16 @@ export async function markRetry(id: number, error: string, nextAttemptAt: string
 }
 
 /**
- * Push every still-queued row for a chat that sits after `afterId` out to at least
- * `nextAttemptAt`. When a row is deferred by a retry, its later same-chat siblings
- * must not become due before it — else claimDue (ordered by id, filtered by
- * next_attempt_at) would deliver a later message ahead of the earlier retried one,
- * breaking in-order delivery per recipient. GREATEST leaves a row already scheduled
- * further out untouched.
+ * A group upgraded to a supergroup: Telegram retired the old chat id and every
+ * queued row addressed to it would 400 forever. Point them at the successor id
+ * (sent/failed rows keep their historical address).
  */
-export async function deferChatRowsAfter(chatId: string, afterId: number, nextAttemptAt: string): Promise<number> {
-  return run(
-    `UPDATE notifications SET next_attempt_at = GREATEST(next_attempt_at, $1::timestamptz), updated_at = $2
-     WHERE chat_id = $3 AND status = 'queued' AND id > $4`,
-    [nextAttemptAt, nowIso(), chatId, afterId],
-  );
+export async function redirectQueuedChat(oldChatId: string, newChatId: string): Promise<number> {
+  return run(`UPDATE notifications SET chat_id = $1, updated_at = $2 WHERE chat_id = $3 AND status = 'queued'`, [
+    newChatId,
+    nowIso(),
+    oldChatId,
+  ]);
 }
 
 /** Give up after the retry budget is exhausted. */

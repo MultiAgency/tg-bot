@@ -28,9 +28,12 @@ It should answer three practical questions:
 - `/admin` — a counts-only overview (incl. notification-queue health) pointing
   at the commands that act
 - Notifications for every hand-off (see README); all point back at `/open` /
-  `/myapps`, the single source of truth. New-task announcements go to the
-  announcement channel (the primary discovery surface, with a deep-link Apply
-  button) plus opt-in DMs (`/notify on`)
+  `/myapps`, the single source of truth. New-task announcements are
+  room-scoped: a global task goes to the announcement channel (the primary
+  discovery surface, with a deep-link Apply button) plus opt-in DMs
+  (`/notify on`); a room task announces only into its own group and stays off
+  every global discovery surface (global `/open`, inline search, the Mini App
+  board) — the bot never amplifies a self-registered room beyond itself
 
 ### Notification pipeline
 
@@ -45,10 +48,14 @@ the acting user stay synchronous; only pushes queue.
 
 ```
 Task:         Draft ──approve──▶ Open ──close──▶ Closed ──reopen──▶ Open
+                 └──discard──▶ deleted            (reject path: a draft may distill
+                                                   unreleased group chatter — dismissing
+                                                   it must not force an announcement)
 
 Application:  Applied ──assign──▶ Assigned        (admin, up to max_assignees)
                  │  ──decline──▶ Declined          (not selected; re-apply allowed, new pitch)
                  │  ──withdraw─▶ Withdrawn
+              Assigned ──withdraw──▶ Withdrawn     (contributor drops after assignment)
               Assigned ──unassign──▶ Applied       (admin, reason recorded)
               Assigned ──work approved──▶ Completed (terminal: slot stays consumed)
               Assigned ──work rejected──▶ Rejected (terminal: slot freed, no re-apply/re-assign)
@@ -88,17 +95,31 @@ label (trusted/flagged) is deliberately deferred until real workflow data
 exists to calibrate what the thresholds should mean. Right-to-erasure via
 `/forget`: profile, applications, submissions, and payout ledger rows deleted;
 history scrubbed of pitches and mentions; task authorship (`created_by`)
-cleared. One guard: a funded escrow payout blocks `/forget` until it is claimed
-or the allocation is revoked — erasing its ledger row would strand NEAR already
-deposited on-chain. The check reads the chain, not just the ledger status:
-`/forget` calls `get_allocation` for every still-owed payout of a linked wallet
-and refuses if any is funded (failing closed on an RPC error), so it also catches
-a payout funded on-chain but not yet reconciled from `pending` to `claimable`.
-One boundary: `allocate`/`claim`
-transactions live on the public NEAR chain permanently — they carry the linked
-NEAR account and a task id, never the Telegram identity, and erasure deletes
-the stored link between the two (`wallet_links`), but the on-chain record
-itself is beyond erasure. `/privacy` discloses both. Erased PII leaves
+cleared. Money-before-erasure guard: `/forget` refuses while money is in flight —
+an open DAO `Transfer` proposal (status `proposed` with a live on-chain proposal
+the council can still approve). Erasing such a ledger row would strand NEAR
+on-chain. The check reads the chain, not just the ledger status (the preflight
+reconciles every `proposed` row), fails closed on an RPC error, and has a
+config-independent in-transaction backstop — so a payout proposed on-chain but
+not yet reconciled in the DB, or a missing `DAO_CONTRACT_ID`, still can't slip an
+in-flight payout past erasure. The preflight reconciles EVERY payout row (not
+only `proposed` ones): a healed claim sits `pending` but keeps the receiver+amount
+of a submit whose proposal may still land late, so it is chain-checked too until
+that memory expires (claim watching is time-bounded by NEAR tx validity —
+`CLAIM_MEMORY_TTL_MS`, 48h), and a paid row is audited for a live duplicate of
+its own transfer. (An abandoned claim only stops blocking once it auto-heals
+past the ~10min grace or its memory expires — within the grace, /forget
+deliberately waits with "try again shortly" rather than race a proposal that
+may still be mid-flight. An out-of-band proposal that first lands *after* the
+check is the council verify-before-vote residual — an external submission can't
+be locked against.) One boundary: the DAO proposal lives
+on the public NEAR chain permanently — it carries the payout account and a task
+number, never the Telegram identity, and erasure deletes the stored link between
+the two, but the on-chain record itself is beyond erasure. When `OUTLAYER_API_KEY`
+is set, that proposal is signed by a third-party TEE service (OutLayer), which
+receives the proposal payload (payout account + task id + amount) to sign on the
+treasury's behalf — a processor in the money path; the bot holds no fund-moving
+key. `/privacy` discloses both. Erased PII leaves
 the live database immediately; copies in Railway's managed backups age out within
 a bounded retention window (6-day daily snapshots, ~7-day point-in-time
 recovery), so a `/forget` is fully effective across every copy within about a
@@ -162,8 +183,13 @@ signal, which records no one).
 - Task↔candidate matching engine (applications are the seam it will attach to)
 - Auto-assignment (revisit if pilot data shows apply→assign latency is the bottleneck)
 - Automated reward optimization (rewards stay free text, e.g. `100 USDC`; the
-  payout ledger snapshots them and on-chain amounts are set at escrow funding)
-- Deadline automation — reminders, expiry, escalation
+  payout ledger snapshots them and a human resolves the on-chain amount at propose time)
+- Deadline automation — expiry and escalation stay out of scope; acting on a
+  stale assignment stays human via `/unassign`. Two bounded surfacing pieces
+  ARE in scope (shipped 2026-07-21): `/admin` counts assignments stale past
+  `STALE_ASSIGNED_DAYS` with nothing submitted, and a one-per-stint pre-stale
+  reminder DM nudges the assignee two days before that threshold — a fair
+  warning so the first staleness signal isn't the unassignment itself
 - Agent memory
 - Campaign planning
 - Advanced reputation / anti-fraud beyond the application cap
@@ -172,6 +198,42 @@ signal, which records no one).
 - Multi-channel support beyond Telegram
 - Admin web dashboard (the Mini App is contributor-facing and read-mostly; the
   `src/web/` tier over the framework-free `src/core/` is the seam)
+
+## Post-pilot simplification review (accretion watch)
+
+Accretion is invisible to per-change review — every layer below passed review
+because each was locally justified. This list is the counterweight: after the
+pilot has real usage, each item is measured against its kill criterion and
+either earns its keep or is removed in one deliberate simplification pass.
+All answers come from existing tables and logs — no new analytics (see the
+data-model rule). Until then: no new layers on these stacks without amending
+this file first.
+
+| Layer | Kill criterion (measure post-pilot) |
+| ----- | ----------------------------------- |
+| Inline share mode + Share button | Zero inline queries served → remove (or never enable inline mode in BotFather) |
+| Classic toggle commands vs `/settings` panel | Whichever surface `signals`/`ai` toggles never arrive through → retire it (keep read-only status commands) |
+| `/notify on` announcement DMs | Opt-in count ~0 (one query on `contributors.announce_opt_in`) → remove toggle + fan-out |
+| Contributor-side `/ai` tools (browse/apply via chat) | Agent-turn logs ~all admin-drafting → narrow the toolset to drafting |
+| `max_assignees > 1` | No multi-slot task ever created (one query) → collapse the slots machinery |
+| Reputation counters on cards | Still gating nothing and uncited by admins → drop from cards until the derived label ships |
+| Env-knob triplication (config.ts + .env.example + README table per var) | Standing cost, not a kill — but any knob never tuned from its default is a candidate to hard-code |
+
+Known era-strata recorded elsewhere (no action): migrations carry two full
+create→drop lifecycles (escrow-era `wallet_links`, watched-set
+`payout_superseded_claims` — see db/migrations/README); reward free-text vs
+pinned yocto amount is the documented promise-vs-payment gap (pre-mainnet item).
+
+## Trust model (stated, not implied)
+
+Operator-curated tasks, council-backed payouts. Global tasks come only from the
+operator's global admins; a room's tasks come from its own admins and reach only
+that room. There is deliberately no open task-posting, no owner/admin
+reputation, no dispute process, and no sybil defense beyond the per-account
+application cap — the trust anchors are the human review step, the room-scoping
+of announcements, and the DAO council's vote before any money moves. Advanced
+reputation / anti-fraud stays out of scope (above) until real workflow data
+motivates it.
 
 ## Boundaries to preserve
 
@@ -183,8 +245,10 @@ signal, which records no one).
   outcome. Widening that is a /privacy change, not a schema tweak.
 - Notifications never carry state — `/open` and `/myapps` are canonical.
 - All durable state lives in PostgreSQL; the process is disposable. (The only
-  in-memory state is in-flight wizard sessions — a restart loses wizard progress,
-  never task data.)
+  in-memory state is in-flight wizard sessions and the deliberately RAM-only AI
+  state — agent conversations, the room context window, the agent's hourly
+  budget counters. A restart loses those, never task data; for the AI state,
+  never persisting it is the privacy design, not an accident.)
 
 ## Done when
 

@@ -1,0 +1,14 @@
+-- 011 — persist the proposed DAO Transfer amount on the payout row.
+--
+-- Reconciliation has no other record of the intended amount (payouts.reward is
+-- free text), so before this it could only match an orphaned proposal by
+-- description + receiver. That let a contributor — who IS the receiver — front-run
+-- their own payout with an inflated-amount proposal carrying the (public,
+-- predictable) description; reconcile would adopt it (newest wins) and the
+-- council could rubber-stamp an overpay. amount_yocto pins exactly what was
+-- proposed so reconcile refuses any proposal that doesn't pay it. It also gives a
+-- genuinely-executed orphan a safe identity (receiver+amount) to be adopted as
+-- 'paid' instead of dead-ending, closing the stuck-'proposed' / double-pay trap.
+--
+-- yoctoNEAR decimal string; null while pending (nothing proposed yet).
+ALTER TABLE payouts ADD COLUMN amount_yocto TEXT;

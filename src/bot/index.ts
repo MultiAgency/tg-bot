@@ -1,8 +1,10 @@
 import { Telegraf, session, Scenes, Markup } from 'telegraf';
+import { message } from 'telegraf/filters';
 import { config, isAdmin } from '../config.js';
-import { type BotContext, SCENES, displayName, commandArg, parseId, requirePrivateChat, safeAnswerCb } from './context.js';
+import { type BotContext, SCENES, displayName, commandArg, parseId, requirePrivateChat, safeAnswerCb, messageText } from './context.js';
 import {
   approveTask,
+  discardDraft,
   closeTask,
   reopenTask,
   assignApplication,
@@ -22,6 +24,9 @@ import {
   countDraftTasks,
   countOpenTasks,
   countActiveAssignments,
+  countStaleAssignments,
+  queueAges,
+  productStats,
   countSubmittedForReview,
   listApplicantsAwaiting,
   countApplicationsAwaitingPerTask,
@@ -40,22 +45,30 @@ import {
   errorMessage,
   WorkflowError,
   registerRoom,
+  migrateRoomChat,
   setRoomSignals,
   setRoomAi,
   addRoomAdmin,
   removeRoomAdmin,
   listRoomAdmins,
   isRoomAdmin,
+  canManageTask,
   listRoomsAdministeredBy,
   getRoom,
   signalCountsForRoom,
   isTaskPublic,
   listPayoutsByStatus,
-  reconcilePayoutOnChain,
-  payableWalletLink,
+  listPayoutsByContributor,
+  listPendingPayoutsForTask,
+  reconcilePayout,
+  proposalWindow,
+  pinnedAmountNear,
   submitRefusal,
+  proposePayout,
+  getPayoutAccount,
+  setPayoutAccount,
+  type Payout,
 } from '../core/service.js';
-import { allocateCommand, formatNear } from '../near/escrow.js';
 import type { Task } from '../core/models/task.js';
 import type { Application } from '../core/models/application.js';
 import { ApplicationStatus } from '../core/workflow.js';
@@ -74,11 +87,12 @@ import {
   chunkMessage,
   fullSubmissionText,
   truncate,
-  esc,
+  safeSlice,
+  field,
   who,
 } from './format.js';
 import {
-  approveButton,
+  draftButtons,
   applyAffordanceBtn,
   deepLinkApplyButton,
   applicantRow,
@@ -90,14 +104,18 @@ import {
 import {
   notifyContributorReview,
   notifyApplicant,
+  notifyApplicantsTaskChanged,
+  notifyErasureRequest,
   buildAnnounceRows,
   enqueueAnnounceRows,
   sendSubmissionAttachment,
   notifyRoomRegistered,
   notifyRoomAdminPromoted,
+  notifyRoomWelcome,
 } from './notify.js';
 import { handleGroupMessage } from './signals.js';
-import { runAgentTurn } from '../ai/agent.js';
+import { getLastProposalId, parseNearToYocto } from '../near/dao.js';
+import { runAgentTurn, claimAgentSlot } from '../ai/agent.js';
 import type { AgentEnv } from '../ai/agentTools.js';
 import { runDetached } from './background.js';
 import { RETENTION_DAYS } from './worker.js';
@@ -115,18 +133,10 @@ const help = async (ctx: BotContext): Promise<string> => {
     admin: isAdmin(uid),
     roomAdmin: uid !== undefined && (await listRoomsAdministeredBy(uid)).length > 0,
     ai: ai.aiEnabled(),
+    dao: Boolean(config.daoContractId),
+    support: config.supportContact || null,
   });
 };
-
-/**
- * Room-aware role check: global admins manage every task; room admins manage
- * the tasks that belong to a room they administer (task.room_chat_id). A task
- * with no room (created via DM) is global-admin-only.
- */
-async function canManageTask(userId: number | undefined, task: Pick<Task, 'room_chat_id'> | undefined): Promise<boolean> {
-  if (isAdmin(userId)) return true;
-  return userId !== undefined && task?.room_chat_id != null && (await isRoomAdmin(task.room_chat_id, userId));
-}
 
 /**
  * Command-side gate for GLOBAL-admin commands (/newtask, /admin, /forget —
@@ -142,6 +152,26 @@ async function requireAdminCmd(ctx: BotContext): Promise<boolean> {
     return false;
   }
   return requirePrivateChat(ctx, 'common.adminPrivateOnly');
+}
+
+/** Deep link to a proposal in the operator's governance UI (the DAO_PROPOSAL_URL
+ *  template), or null when none is configured — the bot shows where to verify
+ *  and vote, never a voting affordance of its own. */
+function proposalUrl(id: number | null): string | null {
+  return id != null && config.daoProposalUrl !== '' ? config.daoProposalUrl.replaceAll('{id}', String(id)) : null;
+}
+
+/** The single pending payout `taskId` names, or null after replying why not
+ *  (none, or several — multi-assignee payout targeting isn't built yet). */
+async function singleTaskPayout(ctx: BotContext, L: string, taskId: number): Promise<Payout | null> {
+  const rows = await listPendingPayoutsForTask(taskId);
+  if (rows.length === 1) return rows[0];
+  await ctx.reply(
+    rows.length === 0
+      ? t(L, 'payouts.noneForTask', { taskId })
+      : t(L, 'payouts.multipleForTask', { taskId, count: rows.length }),
+  );
+  return null;
 }
 
 /**
@@ -182,10 +212,17 @@ const inScope = (scope: 'all' | Set<number>, task: Pick<Task, 'room_chat_id'> | 
  * of the bot (needs BOT_USERNAME), or a reply to one of the bot's own messages
  * (needs ctx.botInfo, which Telegraf populates at launch — also how a multi-turn
  * clarifying answer naturally comes back).
+ *
+ * A FORWARDED message never addresses the bot: the agent runs under the
+ * SENDER's identity and privileges (isManager, tool access), but a forward's
+ * text was authored by someone else — a manager relaying "look what this person
+ * sent" must not have attacker-worded text drive a tool-firing turn as if the
+ * manager typed it. Forwards stay ambient chatter like any other group text.
  */
 function addressesBot(ctx: BotContext): boolean {
   const msg = ctx.message;
   if (msg === undefined || !('text' in msg)) return false;
+  if ('forward_origin' in msg && msg.forward_origin !== undefined) return false;
   const botId = ctx.botInfo?.id;
   if (botId !== undefined && msg.reply_to_message?.from?.id === botId) return true;
   const uname = config.botUsername;
@@ -216,12 +253,52 @@ const requirePrivateCmd = (ctx: BotContext): Promise<boolean> =>
   requirePrivateChat(ctx, 'common.privateOnly');
 
 /**
+ * Callback twin of requirePrivateCmd, for button families whose cards are only
+ * ever POSTED in DMs (the home menu, withdraw). Callback data is
+ * client-tamperable: a matching callback arriving from a group can only be
+ * forged onto some group message the bot sent — refuse it before it dumps
+ * personal data into the group or lets callbackMutation's card edit rewrite a
+ * shared surface (e.g. the announcement post).
+ */
+async function requirePrivateCb(ctx: BotContext): Promise<boolean> {
+  if (ctx.chat?.type === 'private') return true;
+  await safeAnswerCb(ctx, t(localeOf(ctx), 'common.privateOnly', { username: config.botUsername || null }), {
+    show_alert: true,
+  });
+  return false;
+}
+
+/**
+ * The callback_data of every button on a callback's HOST message. The host
+ * message and its keyboard arrive server-attested in the update — the one
+ * provenance a forged callback can't fake, since callback data itself is
+ * client-tamperable. The ONE extraction behind every host-provenance check
+ * (callbackMutation's exact-match, the pg: pager's class-match) — the
+ * predicates differ deliberately, the extraction must not.
+ */
+function hostButtonData(ctx: BotContext): string[] {
+  const host = ctx.callbackQuery?.message;
+  const keyboard = host && 'reply_markup' in host ? host.reply_markup?.inline_keyboard : undefined;
+  return keyboard?.flat().flatMap((b) => ('callback_data' in b ? [b.callback_data] : [])) ?? [];
+}
+
+/** The error popup for a thrown callback handler. Every path out of a
+ *  bot.action must still answer the query — an unanswered query is a stuck
+ *  spinner and, minutes later, a dead button — so catch blocks funnel here. */
+function answerCbError(ctx: BotContext, L: string, err: unknown): Promise<unknown> {
+  return safeAnswerCb(ctx, errorMessage(err, t(L, 'common.somethingWrong')), { show_alert: true });
+}
+
+/**
  * Shared skeleton for callback buttons that commit one service mutation.
  * It pins three easy-to-drop invariants in one place:
- *  - only the mutation sits inside the try — once it commits, a failure below
- *    must surface in bot.catch, not as a false "Something went wrong";
- *  - the durable follow-up (outcome.enqueue) runs straight after the commit,
- *    before any Telegram send can fail and cost it;
+ *  - the mutation and its outcome enqueue COMMIT TOGETHER: the follow-up DM is
+ *    one-shot (a retry tap bounces off the service guard, so its dedup key is
+ *    never revisited) — enqueued after the commit, a crash between the two
+ *    would lose it permanently. A failure rolls both back and shows the error
+ *    popup; the admin simply taps again.
+ *  - every path out answers the callback (an unanswered query is a stuck
+ *    spinner and, minutes later, a dead button);
  *  - the card edit tolerates a stale or deleted card instead of throwing.
  * `gate` is the role check (requireManageCb), or null when the service mutation
  * enforces ownership itself (withdraw).
@@ -234,17 +311,31 @@ async function callbackMutation<T>(
 ): Promise<void> {
   if (gate && !(await gate(ctx))) return;
   const L = localeOf(ctx);
-  let result: T;
+  let popup: string;
+  let card: string;
   try {
-    result = await mutate();
+    ({ popup, card } = await withTransaction(async () => {
+      const result = await mutate();
+      const out = await outcome(result, L);
+      await out.enqueue?.();
+      return out;
+    }));
   } catch (err) {
-    await safeAnswerCb(ctx, errorMessage(err, t(L, 'common.somethingWrong')), { show_alert: true });
+    await answerCbError(ctx, L, err);
     return;
   }
-  const { enqueue, popup, card } = await outcome(result, L);
-  await enqueue?.();
   await safeAnswerCb(ctx, popup);
-  await ctx.editMessageText(card).catch(() => undefined);
+  // Edit only a host message that actually CARRIES the tapped button
+  // (hostButtonData — the same provenance rule as the pg: paginator, exact
+  // match here because a mutation card is single-audience). Without this, a
+  // user who passes the role gate could attach e.g. `approve:<their draft>` to
+  // ANY message the bot ever sent (an announcement post, another room's card)
+  // and have this edit rewrite it. The mutation itself is theirs to make
+  // either way; the defacement is not.
+  const tapped = ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
+  if (tapped !== undefined && hostButtonData(ctx).includes(tapped)) {
+    await ctx.editMessageText(card).catch(() => undefined);
+  }
 }
 
 /**
@@ -353,17 +444,22 @@ export function createBot(): Telegraf<BotContext> {
 
   // /start may carry a deep-link payload from the announcement channel's Apply
   // button (?start=t<taskId>) — jump straight into applying for that task.
+  // A cold /start gets an orientation (what this is, the loop, that work pays)
+  // rather than the /help command manifest — a first-time contributor decides
+  // whether to stay in the first ten seconds, not from a reference card.
   bot.start(async (ctx) => {
     const match = /^t(\d+)$/.exec(ctx.startPayload ?? '');
     if (match) return ctx.scene.enter(SCENES.apply, { taskId: Number(match[1]) });
-    return replyHelp(ctx, await help(ctx));
+    return replyHelp(ctx, t(localeOf(ctx), 'start.welcome', { dao: Boolean(config.daoContractId) }));
   });
   bot.help(async (ctx) => replyHelp(ctx, await help(ctx)));
 
   // Home-menu taps. All targets are DM-only (My work renders the invoker's
   // applications; the paginators/panel are personal), so the menu is only shown
-  // in a DM and these re-answer the callback then act in that same private chat.
+  // in a DM — and the gate re-checks that, since the callback data could be
+  // forged onto any group message the bot sent.
   bot.action(/^home:(open|myapps|settings|help)$/, async (ctx) => {
+    if (!(await requirePrivateCb(ctx))) return;
     const L = localeOf(ctx);
     await safeAnswerCb(ctx);
     const what = ctx.match[1];
@@ -373,10 +469,13 @@ export function createBot(): Telegraf<BotContext> {
     return void (await ctx.reply(await help(ctx)));
   });
 
-  // Inline mode (@bot <query> from ANY chat): search open tasks and offer each as
-  // a shareable teaser carrying an Apply deep link — the way to spread a bounty
-  // into other communities without leaving the chat. Also what the /open "Share"
-  // button (switch_inline_query) drives. Requires inline mode enabled in BotFather.
+  // Inline mode (@bot <query> from ANY chat): search the GLOBAL open board and
+  // offer each task as a shareable teaser carrying an Apply deep link — the way
+  // to spread an agency bounty into other communities without leaving the chat.
+  // Also what the /open "Share" button (switch_inline_query) drives. Global
+  // tasks only: an inline result can land in any chat, and a room task is
+  // room-scoped — the bot must not amplify it beyond its group (see
+  // service.listOpenTasks). Requires inline mode enabled in BotFather.
   //
   // Telegram fires an inline_query per KEYSTROKE, and every query derives from
   // the same live open-task list — memo it for the window the answer's
@@ -399,16 +498,20 @@ export function createBot(): Telegraf<BotContext> {
       type: 'article' as const,
       id: String(task.id),
       // title/description are plain-text result-list fields — never HTML-parsed.
-      title: task.title.slice(0, 100),
+      // safeSlice, not slice: a cut mid-emoji leaves an unpaired surrogate that
+      // renders as a stray U+FFFD in the result list.
+      title: safeSlice(task.title, 100),
       description:
-        [
-          task.reward ? `🎁 ${task.reward}` : '',
-          task.deadline ? `⏳ ${task.deadline}` : '',
-          task.max_assignees > 1 ? `👥 ${task.max_assignees}` : '',
-        ]
-          .filter(Boolean)
-          .join(' · ')
-          .slice(0, 100) || 'Open task — tap to share',
+        safeSlice(
+          [
+            task.reward ? `🎁 ${task.reward}` : '',
+            task.deadline ? `⏳ ${task.deadline}` : '',
+            task.max_assignees > 1 ? `👥 ${task.max_assignees}` : '',
+          ]
+            .filter(Boolean)
+            .join(' · '),
+          100,
+        ) || t(L, 'inline.openTask'),
       input_message_content: { message_text: taskShareText(task), parse_mode: 'HTML' as const },
       ...(config.botUsername
         ? { reply_markup: deepLinkApplyButton(task, config.botUsername, L).reply_markup }
@@ -423,11 +526,21 @@ export function createBot(): Telegraf<BotContext> {
   // so it answers anywhere — including groups, where the curious will ask.
   // The retention numbers come from the constants that enforce them, so the
   // statement can't silently drift from the mechanism.
+  bot.command('terms', (ctx) =>
+    ctx.reply(
+      t(localeOf(ctx), 'terms.text', {
+        dao: Boolean(config.daoContractId),
+        support: config.supportContact || null,
+      }),
+    ),
+  );
+
   bot.command('privacy', (ctx) =>
     ctx.reply(
       t(localeOf(ctx), 'privacy.text', {
         ai: ai.aiEnabled(),
         notifRetentionDays: RETENTION_DAYS,
+        support: config.supportContact || null,
       }),
     ),
   );
@@ -488,12 +601,12 @@ export function createBot(): Telegraf<BotContext> {
 
   const clampPage = (page: number, total: number): number => Math.min(Math.max(page, 0), Math.max(0, total - 1));
 
-  const navRow = (key: string, arg: number, page: number, total: number): Btn[][] => {
+  const navRow = (key: string, arg: number, page: number, total: number, L: string): Btn[][] => {
     if (total <= 1) return [];
     const nav: Btn[] = [];
-    if (page > 0) nav.push(Markup.button.callback('◀ Prev', `pg:${key}:${arg}:${page - 1}`));
+    if (page > 0) nav.push(Markup.button.callback(t(L, 'btn.prev'), `pg:${key}:${arg}:${page - 1}`));
     nav.push(Markup.button.callback(`${page + 1}/${total}`, 'pg:noop'));
-    if (page < total - 1) nav.push(Markup.button.callback('Next ▶', `pg:${key}:${arg}:${page + 1}`));
+    if (page < total - 1) nav.push(Markup.button.callback(t(L, 'btn.next'), `pg:${key}:${arg}:${page + 1}`));
     return [nav];
   };
 
@@ -503,7 +616,10 @@ export function createBot(): Telegraf<BotContext> {
     applyAffordanceBtn(task, ctx.chat?.type === 'private', config.botUsername, L);
 
   async function openPage(ctx: BotContext, page: number, L: string): Promise<PageView> {
-    const open = await listOpenTasks();
+    // Room-scoped (see service.listOpenTasks): in a group, that room's tasks
+    // plus the global board; in a DM (or anywhere else), the global board only.
+    const inGroup = ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup';
+    const open = await listOpenTasks(inGroup ? ctx.chat!.id : null);
     if (open.length === 0) return { text: t(L, 'open.none'), rows: [] };
     const p = clampPage(page, open.length);
     const task = open[p];
@@ -514,10 +630,17 @@ export function createBot(): Telegraf<BotContext> {
     const action: Btn[] = [];
     const apply = assigned < task.max_assignees ? applyButtonFor(ctx, task, L) : null;
     if (apply) action.push(apply);
-    // Inline queries cap at 256 chars — a raw slice (no ellipsis) keeps the
-    // prefilled query a prefix the inline handler's includes() filter still matches.
-    action.push(Markup.button.switchToChat(t(L, 'btn.share'), task.title.slice(0, 256)));
-    return { text: taskDetail(task, assigned), rows: [action, ...navRow('open', 0, p, open.length)] };
+    // Inline queries cap at 256 chars — a plain prefix cut (no ellipsis) keeps
+    // the prefilled query a prefix the inline handler's includes() filter still
+    // matches; safeSlice so a mid-emoji cut can't end it in U+FFFD (which would
+    // match nothing). Room tasks get no Share button: the inline result set is
+    // the GLOBAL board (a room task must not spread bot-amplified into other
+    // chats), so the prefilled query would find nothing — members forward the
+    // room announcement natively instead.
+    if (task.room_chat_id == null) {
+      action.push(Markup.button.switchToChat(t(L, 'btn.share'), safeSlice(task.title, 256)));
+    }
+    return { text: taskDetail(task, assigned), rows: [action, ...navRow('open', 0, p, open.length, L)] };
   }
 
   async function applicantsPage(task: Task, page: number, L: string): Promise<PageView> {
@@ -534,7 +657,7 @@ export function createBot(): Telegraf<BotContext> {
     const app = applicants[p];
     const c = await getContributor(app.contributor_id);
     const actions: Btn[] = applicantRow(app, L);
-    return { text: `${header}\n\n${applicantCard(app, c)}`, rows: [actions, ...navRow('appl', task.id, p, applicants.length)] };
+    return { text: `${header}\n\n${applicantCard(app, c)}`, rows: [actions, ...navRow('appl', task.id, p, applicants.length, L)] };
   }
 
   async function activePage(scope: 'all' | Set<number>, page: number, L: string): Promise<PageView> {
@@ -559,7 +682,7 @@ export function createBot(): Telegraf<BotContext> {
       activeLine(app, task, latestByApp.get(app.id), byId.get(app.contributor_id)),
     );
     const text = clampMessage(`${t(L, 'active.header', { n: active.length, lines: lines.join('\n') })}\n\n${t(L, 'active.hint')}`);
-    return { text, rows: navRow('actv', 0, p, pages) };
+    return { text, rows: navRow('actv', 0, p, pages, L) };
   }
 
   const sendPage = (ctx: BotContext, view: PageView): Promise<unknown> =>
@@ -570,24 +693,46 @@ export function createBot(): Telegraf<BotContext> {
   // The i/N indicator is a live button (Telegram has no inert buttons); it just acks.
   bot.action('pg:noop', (ctx) => safeAnswerCb(ctx));
   bot.action(/^pg:(open|appl|actv):(\d+):(\d+)$/, async (ctx) => {
+    // /open pages live in groups too, so a private-chat gate (the home:*
+    // pattern) would break legit group pagination. The forged-callback risk is
+    // editPage rewriting a DIFFERENT bot message (e.g. the shared announcement):
+    // close it by only editing a message that IS a paginator — the host
+    // message + keyboard arrive server-attested in the callback update, so a
+    // pg: callback forged onto anything without pg: nav buttons is refused.
+    // Class-match (not exact) on purpose: a shared group pager's keyboard is
+    // edited under concurrent taps, so the exact tapped data may already be
+    // one page stale — carrying pg: buttons at all is the provenance.
+    const isPager = hostButtonData(ctx).some((d) => d.startsWith('pg:'));
+    if (!isPager) return void safeAnswerCb(ctx);
     const key = ctx.match[1];
+    // The manager pages (applicants, active work) are only ever POSTED in DMs —
+    // arriving from a group they're forged onto a legit group /open paginator,
+    // and editPage would rewrite it into applicant pitches / assignee names in
+    // front of the whole group. Same DM-only-card rule as requirePrivateCb.
+    if (key !== 'open' && !(await requirePrivateCb(ctx))) return;
     const arg = Number(ctx.match[2]);
     const page = Number(ctx.match[3]);
     const L = localeOf(ctx);
+    // The page build is several DB reads — a throw mid-build must still answer
+    // the callback (as an error popup), or the nav tap spins forever.
     let view: PageView;
-    if (key === 'appl') {
-      // The card outlives a demotion — re-check management of THIS task per tap.
-      const task = await getTask(arg);
-      if (!(await requireManageCb(async () => task)(ctx))) return;
-      // A global admin passes the gate even when the row is gone — mirror the
-      // command's "not manageable" reply instead of rendering a page.
-      view = task ? await applicantsPage(task, page, L) : { text: t(L, 'task.notManageable', { id: arg }), rows: [] };
-    } else if (key === 'actv') {
-      const scope = await resolveScope(ctx.from?.id);
-      if (!scope) return void safeAnswerCb(ctx, t(L, 'common.adminsOnly'), { show_alert: true });
-      view = await activePage(scope, page, L);
-    } else {
-      view = await openPage(ctx, page, L);
+    try {
+      if (key === 'appl') {
+        // The card outlives a demotion — re-check management of THIS task per tap.
+        const task = await getTask(arg);
+        if (!(await requireManageCb(async () => task)(ctx))) return;
+        // A global admin passes the gate even when the row is gone — mirror the
+        // command's "not manageable" reply instead of rendering a page.
+        view = task ? await applicantsPage(task, page, L) : { text: t(L, 'task.notManageable', { id: arg }), rows: [] };
+      } else if (key === 'actv') {
+        const scope = await resolveScope(ctx.from?.id);
+        if (!scope) return void safeAnswerCb(ctx, t(L, 'common.adminsOnly'), { show_alert: true });
+        view = await activePage(scope, page, L);
+      } else {
+        view = await openPage(ctx, page, L);
+      }
+    } catch (err) {
+      return void answerCbError(ctx, L, err);
     }
     await safeAnswerCb(ctx);
     await editPage(ctx, view);
@@ -622,7 +767,7 @@ export function createBot(): Telegraf<BotContext> {
     const drafts = (await listDraftTasks()).filter((task) => inScope(scope, task));
     if (drafts.length === 0) return ctx.reply(t(L, 'approve.none'));
     await ctx.reply(t(L, 'approve.count', { n: drafts.length }));
-    await listCapped(ctx, L, drafts, (task) => ctx.reply(taskDetail(task, 0), approveButton(task, L)));
+    await listCapped(ctx, L, drafts, (task) => ctx.reply(taskDetail(task, 0), draftButtons(task, L)));
   });
 
   // ---- Open tasks & applying ----
@@ -739,12 +884,14 @@ export function createBot(): Telegraf<BotContext> {
     const where = perTask.length
       ? ` (${perTask.map((r) => `#${r.task_id}×${r.n}`).join(' ')})`
       : '';
-    const [notif, drafts, open, active, review] = await Promise.all([
+    const [notif, drafts, open, active, stale, review, ages] = await Promise.all([
       notificationCounts(),
       countDraftTasks(),
       countOpenTasks(),
       countActiveAssignments(),
+      countStaleAssignments(config.staleAssignedDays),
       countSubmittedForReview(),
+      queueAges(),
     ]);
     // clampMessage: the per-task `where` breakdown grows with the task count.
     await ctx.reply(
@@ -755,67 +902,255 @@ export function createBot(): Telegraf<BotContext> {
           applications: perTask.reduce((sum, r) => sum + r.n, 0),
           where,
           active,
+          stale,
+          staleDays: config.staleAssignedDays,
           review,
           notifQueued: notif.queued + notif.retrying,
           notifFailed: notif.failed,
+          oldestApplicationDays: ages.applicationDays,
+          oldestReviewDays: ages.reviewDays,
         }),
       ),
     );
   });
 
-  // ---- Escrow funding queue (admin) ----
-  // The bot holds NO treasury key: it reads the chain to show which owed payouts
-  // are funded vs pending, flips their status to match, and — for the pending
-  // ones whose contributor has linked a wallet — prints the exact `allocate`
-  // command for a treasury admin to run themselves (they set the amount, since
-  // `reward` is free text). Reads only; funding stays a human, key-in-hand action.
-  bot.command('payouts', async (ctx) => {
+  // ---- Funnel stats (admin): is the loop actually working? ----
+  // Counts only, derived from the workflow tables — the launch-question gauge
+  // (activation, throughput, settlement) without an analytics pipeline.
+  bot.command('stats', async (ctx) => {
     const L = localeOf(ctx);
     if (!(await requireAdminCmd(ctx))) return;
-    const owed = await listPayoutsByStatus(['pending', 'claimable']);
+    const s = await productStats();
+    await ctx.reply(
+      t(L, 'stats.overview', {
+        ...s,
+        activationPct: s.contributors > 0 ? Math.round((100 * s.applicants) / s.contributors) : null,
+      }),
+    );
+  });
+
+  // ---- Config preflight (admin) ----
+  // Pass/fail the wiring that otherwise fails silently and LATE: a wrong
+  // announce chat surfaces at approval time as an announcement nobody sees; a
+  // missing OutLayer key at the first real /pay, in front of a waiting
+  // contributor. Run this after deploy and any env change.
+  bot.command('diag', async (ctx) => {
+    const L = localeOf(ctx);
+    if (!(await requireAdminCmd(ctx))) return;
+    const oops = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+    const lines: string[] = [t(L, 'diag.title')];
+    try {
+      await countOpenTasks();
+      lines.push(t(L, 'diag.db', { ok: true }));
+    } catch {
+      lines.push(t(L, 'diag.db', { ok: false }));
+    }
+    lines.push(t(L, 'diag.admins', { n: config.adminIds.size }));
+    if (!config.announceChatId) lines.push(t(L, 'diag.announceMissing'));
+    else {
+      try {
+        const chat = await ctx.telegram.getChat(config.announceChatId);
+        lines.push(t(L, 'diag.announceOk', { title: 'title' in chat ? chat.title ?? '' : '' }));
+      } catch (err) {
+        lines.push(t(L, 'diag.announceFail', { error: oops(err) }));
+      }
+    }
+    try {
+      const me = await ctx.telegram.getMe();
+      lines.push(t(L, me.can_read_all_group_messages ? 'diag.privacyOff' : 'diag.privacyOn'));
+    } catch {
+      // Purely informational — getMe failing here will show up everywhere else anyway.
+    }
+    if (!config.daoContractId) lines.push(t(L, 'diag.daoOff'));
+    else {
+      const started = Date.now();
+      try {
+        // getLastProposalId, NOT getPolicy: the policy is served from a 60s
+        // in-module cache, so a cached read would report "DAO OK (~0ms)" while
+        // the RPC is down — the exact silent failure /diag exists to surface.
+        await getLastProposalId();
+        lines.push(t(L, 'diag.daoOk', { dao: config.daoContractId, ms: Date.now() - started }));
+      } catch (err) {
+        lines.push(t(L, 'diag.daoFail', { dao: config.daoContractId, error: oops(err) }));
+      }
+    }
+    lines.push(
+      config.outlayerApiKey
+        ? t(L, 'diag.outlayerOn')
+        : t(L, 'diag.outlayerOff', { daoOn: Boolean(config.daoContractId) }),
+    );
+    lines.push(config.webPort ? t(L, 'diag.webOn', { url: config.webAppUrl }) : t(L, 'diag.webOff'));
+    lines.push(ai.aiEnabled() ? t(L, 'diag.aiOn') : t(L, 'diag.aiOff'));
+    await ctx.reply(clampMessage(lines.join('\n')));
+  });
+
+  // ---- A contributor's own payouts ----
+  // The bot-side twin of the Mini App's myPayouts: without it a contributor had
+  // no way to see money owed to them unless the Mini App was deployed — the
+  // admin queue below is admin-only. Same reconcile dispatch, contributor-toned
+  // status lines, one clamped message (own payout counts stay small).
+  async function myPayoutsView(ctx: BotContext, L: string): Promise<void> {
+    if (!(await requirePrivateCmd(ctx))) return;
+    const uid = ctx.from!.id;
+    const rows = await listPayoutsByContributor(uid);
+    if (rows.length === 0) return void (await ctx.reply(t(L, 'payouts.mineNone')));
+    const railConfigured = Boolean(config.daoContractId);
+    const window = proposalWindow();
+    // reconcilePayout owns the rail-off case (it returns the row's committed
+    // state, read-free) — a caller-side skip here once hand-rolled that state
+    // and drifted (hardcoded attention:false), rendering the same row
+    // differently than the Mini App.
+    const recs = await Promise.all(rows.map((p) => reconcilePayout(p, window)));
+    const tasksById = new Map(
+      (await listTasksByIds([...new Set(rows.map((p) => p.task_id))])).map((tk) => [tk.id, tk]),
+    );
+    const lines = rows.map((p, i) => {
+      const rec = recs[i];
+      // Wording keys off the rail even though the reconcile no longer does:
+      // with no DAO configured, "queued — proposed to the DAO next" promises a
+      // flow that will never run; the honest line is off-platform settlement.
+      // `held` is the benign young-claim case (the admin surface's claimHeld
+      // twin), and a live duplicate proposal folds into the attention wording —
+      // the same fold the Mini App applies (web/api.ts myPayouts).
+      const statusKey =
+        rec.status === 'paid'
+          ? 'payouts.mineStatus.paid'
+          : !railConfigured
+            ? 'payouts.mineStatus.recorded'
+            : !rec.ok
+              ? rec.held
+                ? 'payouts.mineStatus.held'
+                : 'payouts.mineStatus.checkFailed'
+              : rec.attention || rec.duplicateProposals
+                ? 'payouts.mineStatus.attention'
+                : rec.status === 'proposed'
+                  ? 'payouts.mineStatus.proposed'
+                  : 'payouts.mineStatus.pending';
+      const pinned = pinnedAmountNear(p, rec);
+      return t(L, 'payouts.mineLine', {
+        taskId: p.task_id,
+        title: tasksById.get(p.task_id)?.title ?? null,
+        reward: p.reward,
+        amountNear: pinned,
+        status: t(L, statusKey),
+      });
+    });
+    const parts = [t(L, 'payouts.mineHeader'), ...lines];
+    const unsettled = recs.some((r) => r.status !== 'paid');
+    // Who releases the money: the row statuses say "the council" — this says
+    // what that is, once per view, whenever an on-chain settlement lies ahead.
+    if (railConfigured && unsettled) {
+      parts.push('', t(L, 'payouts.mineCouncilNote', { support: config.supportContact || null }));
+    }
+    // The funnel nudge, where the money is actually blocked on the contributor:
+    // an unpaid payout with no saved account cannot be sent anywhere.
+    if (railConfigured && unsettled && (await getPayoutAccount(uid)) === null) {
+      parts.push('', t(L, 'notify.paytoNudge'));
+    }
+    await ctx.reply(clampMessage(parts.join('\n')));
+  }
+
+  // ---- DAO payout queue (admin) ----
+  // The bot holds NO fund-moving key: it reads the DAO to show which owed payouts
+  // are unstarted vs proposed, flips their status to match, and points the admin
+  // at /pay to propose a Transfer the council then approves. Reads only; payment
+  // stays a human, key-in-hand DAO vote.
+  bot.command('payouts', async (ctx) => {
+    const L = localeOf(ctx);
+    // Dual-mode: global admins get the settlement queue; everyone else gets
+    // their own payouts (requireAdminCmd's "Admins only" would otherwise be the
+    // whole contributor experience of the money surface).
+    if (!isAdmin(ctx.from?.id)) return void (await myPayoutsView(ctx, L));
+    if (!(await requireAdminCmd(ctx))) return;
+    // Both open states: pending (unstarted) and proposed (a DAO vote in flight —
+    // or a FAILED transfer needing an admin).
+    const owed = await listPayoutsByStatus(['pending', 'proposed']);
     if (owed.length === 0) return ctx.reply(t(L, 'payouts.none'));
+    // Most-actionable first (oldest first within each status — the sort is
+    // stable): pending is what the admin ACTS on here, proposed may need a re-finalize.
+    const rank: Record<string, number> = { pending: 0, proposed: 1 };
+    owed.sort((a, b) => (rank[a.status] ?? 2) - (rank[b.status] ?? 2));
     // One reply per payout, capped like every other admin list (a single joined
     // message would silently clamp past ~12 rows, and a missed row here is
-    // missed money) — funding the shown ones shrinks the queue. Context, wallet
-    // links, and chain reads are fetched for the shown page only; later rows
-    // reconcile when they reach a page.
+    // missed money). Context and chain reads are fetched for the shown page only;
+    // later rows reconcile when they reach a page.
     const page = owed.slice(0, LIST_PAGE);
-    const [byId, tasksById, links] = await Promise.all([
+    const [byId, tasksById] = await Promise.all([
       listContributorsByIds([...new Set(page.map((p) => p.contributor_id))]).then(
         (cs) => new Map(cs.map((c) => [c.telegram_id, c])),
       ),
       listTasksByIds([...new Set(page.map((p) => p.task_id))]).then((ts) => new Map(ts.map((tk) => [tk.id, tk]))),
-      // Only a link on the configured network is fundable — a mainnet allocate
-      // to a testnet-only account name is money nobody can claim.
-      Promise.all(page.map((p) => payableWalletLink(p.contributor_id))),
     ]);
-    // The chain reads (inside reconcilePayoutOnChain — the shared settlement rule)
-    // are independent: one round trip's latency for the page, not one per row. A
-    // row with a pinned funded account reconciles even without a current link.
-    const recs = await Promise.all(page.map((p, i) => reconcilePayoutOnChain(p, links[i]?.account_id)));
+    // Rail-off (no DAO configured) is resolved INSIDE reconcilePayout — it
+    // returns the row's committed state without a chain read, so every surface
+    // (this queue, myPayoutsView, the Mini App) renders the same answer.
+    // railConfigured below only drives the per-row wording (offPlatform).
+    const railConfigured = Boolean(config.daoContractId);
+    // The chain reads (inside reconcilePayout) are independent: one round trip's
+    // latency for the page, not one per row — and one shared proposal-window
+    // snapshot (lazy, so it costs nothing when no row needs a scan) for the
+    // page, not one fetch per scan-needing row.
+    const window = proposalWindow();
+    const recs = await Promise.all(page.map((p) => reconcilePayout(p, window)));
     await ctx.reply(t(L, 'payouts.title'));
+    // Per-row sends are guarded like sendReviewPage's: a transient failure (a
+    // 429, a network blip) stops the listing but MUST fall through to the
+    // remainder notice below — an unhandled throw would silently drop the rest
+    // of the money queue, and a short list here masquerades as the whole thing.
+    let shown = 0;
     for (const [i, p] of page.entries()) {
       const task = tasksById.get(p.task_id);
-      const title = task ? ` <b>${esc(truncate(task.title, 100))}</b>` : '';
-      const head = `#<code>${p.task_id}</code>${title} — 👤 ${who(p.contributor_id, byId.get(p.contributor_id))} · 🎁 ${esc(p.reward)}`;
-      const link = links[i];
-      // The reconciled status is authoritative: once settled we never re-offer
-      // the fund command — a re-run would double-pay. The command shows ONLY when
-      // the payout is still pending AND a successful read confirmed it is
-      // unfunded (`ok`); an unverified read shows "couldn't check", never the command.
-      const { ok, status, funded, amount } = recs[i];
-      if (status === 'claimed') await ctx.reply(`${head}\n${t(L, 'payouts.claimed')}`);
-      else if (status === 'revoked') await ctx.reply(`${head}\n${t(L, 'payouts.revoked')}`);
-      else if (funded && amount) {
-        await ctx.reply(
-          `${head}\n${t(L, 'payouts.funded', { account: p.account_id ?? link!.account_id, amount: formatNear(amount) })}`,
-        );
-      } else if (!link && !p.account_id) await ctx.reply(`${head}\n${t(L, 'payouts.needsWallet')}`);
-      else if (!ok || !link) await ctx.reply(`${head}\n${t(L, 'payouts.checkFailed')}`);
-      else await ctx.reply(`${head}\n${t(L, 'payouts.fundHint')}\n<code>${esc(allocateCommand(p.task_id, link.account_id))}</code>`);
+      const title = task ? ` <b>${field(task.title, 100)}</b>` : '';
+      // reward is snapshotted free text with no service-side length cap — budget
+      // it like taskDetail does (150), and clampMessage every send below: a 400
+      // on one oversized row would abort the loop and silently drop the rest of
+      // the money queue.
+      // Once proposed/paid, show the exact pinned on-chain amount alongside the
+      // advertised (free-text) reward — /pay <amount> can differ from it. The
+      // reconciled-status keying lives in pinnedAmountNear (shared with the
+      // Mini App), so this surface can't drift from that display invariant.
+      const pinned = pinnedAmountNear(p, recs[i]);
+      const amt = pinned ? ` · ◈ ${pinned} NEAR` : '';
+      const head = `#<code>${p.task_id}</code>${title} — 👤 ${who(p.contributor_id, byId.get(p.contributor_id))} · 🎁 ${field(p.reward, 150)}${amt}`;
+      const send = (body: string): Promise<unknown> => ctx.reply(clampMessage(`${head}\n${body}`));
+      // The reconciled status is authoritative: once settled we never re-offer a
+      // pay action — a re-run would double-pay. A money action shows ONLY off a
+      // successful read (`ok`); an unverified read shows "couldn't check" —
+      // except the benign `held` case (a young claim awaiting its proposal),
+      // which gets its own honest line instead of a phantom RPC error.
+      const { ok, status, attention, held, proposalId, duplicateProposals } = recs[i];
+      // Render the reconcile's own proposalId (it may have just adopted/pinned one
+      // this run), falling back to the pre-reconcile snapshot only if it didn't.
+      const pid = proposalId ?? p.proposal_id;
+      try {
+        // A duplicate live twin (the same identity proposed out-of-band alongside
+        // the bot's) is the priority: the council must reject the extra one
+        // BEFORE approving anything, or both could pay.
+        if (!railConfigured) await send(t(L, 'payouts.offPlatform'));
+        else if (duplicateProposals) await send(t(L, 'payouts.duplicate', { proposalId: pid, url: proposalUrl(pid) }));
+        else if (status === 'paid') await send(t(L, 'payouts.paid'));
+        else if (!ok) await send(t(L, held ? 'payouts.claimHeld' : 'payouts.checkFailed'));
+        else if (status === 'proposed') {
+          await send(
+            t(L, attention ? 'payouts.proposalStuck' : 'payouts.proposed', { proposalId: pid, url: proposalUrl(pid) }),
+          );
+        }
+        // Verified-unstarted pending: /pay proposes a DAO Transfer for it —
+        // flagged when the council voted the last proposal down (check first),
+        // and named as blocked when the contributor has no payout account yet
+        // (otherwise the admin discovers the leak only when /pay refuses).
+        else if (attention) await send(t(L, 'payouts.requeued', { taskId: p.task_id }));
+        else if (!byId.get(p.contributor_id)?.payout_account) {
+          await send(t(L, 'payouts.noAccount', { taskId: p.task_id }));
+        } else await send(t(L, 'payouts.payHint', { taskId: p.task_id }));
+      } catch (err) {
+        console.error('[payouts] row send failed, stopping listing:', err instanceof Error ? err.message : err);
+        break;
+      }
+      shown += 1;
     }
-    if (owed.length > page.length) {
-      await ctx.reply(t(L, 'list.more', { shown: page.length, total: owed.length }));
+    if (shown < owed.length) {
+      await ctx.reply(t(L, 'list.more', { shown, total: owed.length })).catch(() => undefined);
     }
   });
 
@@ -920,6 +1255,9 @@ export function createBot(): Telegraf<BotContext> {
   // The Next-page button under a review page: re-checks management (the reviewer
   // may have been demoted since) and sends the page after the anchored id.
   bot.action(/^rev:more:(\d+)$/, async (ctx) => {
+    // Review cards are DM-only; from a group this is a forged callback that
+    // would dump submissions + contributor stats into the group.
+    if (!(await requirePrivateCb(ctx))) return;
     const L = localeOf(ctx);
     const scope = await resolveScope(ctx.from?.id);
     if (!scope) return void safeAnswerCb(ctx, t(L, 'common.adminsOnly'), { show_alert: true });
@@ -929,7 +1267,22 @@ export function createBot(): Telegraf<BotContext> {
 
   // ---- Close / reopen (admin) ----
   bot.command('close', (ctx) =>
-    adminTaskCommand(ctx, closeTask, 'close.usage', 'close.ok', 'task.closeFail'),
+    adminTaskCommand(
+      ctx,
+      // The close and its applicant notices commit together (withTransaction
+      // nests, so closeTask joins this transaction): applicants whose
+      // applications the close just orphaned hear about it — apply and assign
+      // both require an Open task, so without the notice they wait on nothing.
+      (taskId, adminId) =>
+        withTransaction(async () => {
+          const task = await closeTask(taskId, adminId);
+          await notifyApplicantsTaskChanged(task, 'closed');
+          return task;
+        }),
+      'close.usage',
+      'close.ok',
+      'task.closeFail',
+    ),
   );
   bot.command('reopen', (ctx) =>
     adminTaskCommand(ctx, reopenTask, 'reopen.usage', 'reopen.ok', 'task.reopenFail'),
@@ -996,6 +1349,109 @@ export function createBot(): Telegraf<BotContext> {
     }
   });
 
+  // ---- Self-serve erasure REQUEST (contributor) ----
+  // /forgetme files the request with the operators; the erasure itself stays a
+  // human-run /forget behind the money-in-flight guard. Without this, the
+  // /privacy promise ends in "find and petition an admin out-of-band" — the
+  // person who wants their data gone had no in-product way to ask. A confirm
+  // button gates it: consequential enough that a lone typed command (or a
+  // mis-tap of a suggested command) shouldn't file it.
+  bot.command('forgetme', async (ctx) => {
+    const L = localeOf(ctx);
+    if (!(await requirePrivateCmd(ctx))) return;
+    await ctx.reply(
+      t(L, 'forgetme.confirm'),
+      Markup.inlineKeyboard([[Markup.button.callback(t(L, 'btn.forgetme'), 'forgetme:yes')]]),
+    );
+  });
+  bot.action(/^forgetme:yes$/, (ctx) =>
+    callbackMutation(
+      ctx,
+      // DM-gated like the command: forged onto a group message, the card edit
+      // would broadcast someone's erasure request to the room.
+      requirePrivateCb,
+      async () => ({ uid: ctx.from!.id, username: ctx.from!.username ?? null }),
+      async ({ uid, username }, L) => ({
+        enqueue: () => notifyErasureRequest(uid, username),
+        popup: t(L, 'forgetme.popup'),
+        card: t(L, 'forgetme.requested'),
+      }),
+    ),
+  );
+
+  // Optional DAO-push payout (gated on DAO_CONTRACT_ID; dormant otherwise). Proposes
+  // a NEAR Transfer for a task's pending payout through the bot's OutLayer TEE
+  // wallet — the ONLY proposer path (the old printed near-cli fallback was a
+  // replayable out-of-band command, the root of the duplicate-proposal hazard;
+  // without OutLayer, proposePayout refuses with guidance). This ONLY
+  // proposes — a human DAO Approver must vote to release the funds.
+  // Usage: /pay <taskId> <amountNEAR> <recipient.near>
+  bot.command('pay', async (ctx) => {
+    const L = localeOf(ctx);
+    if (!(await requireAdminCmd(ctx))) return;
+    if (!config.daoContractId) return ctx.reply(t(L, 'pay.notEnabled'));
+    const [, taskArg, amountArg, accountArg] = (messageText(ctx) ?? '').split(/\s+/);
+    const taskId = parseId(taskArg);
+    if (taskId === null || !amountArg) return ctx.reply(t(L, 'pay.usage'));
+    const yocto = parseNearToYocto(amountArg);
+    if (!yocto) return ctx.reply(t(L, 'pay.badAmount'));
+    const payout = await singleTaskPayout(ctx, L, taskId);
+    if (!payout) return;
+    const account = accountArg || (await getPayoutAccount(payout.contributor_id));
+    if (!account) return ctx.reply(t(L, 'pay.noRecipient', { taskId, amount: amountArg }));
+    try {
+      // An invalid/over-long account never echoes: proposePayout format-checks it
+      // (assertPayableAccount) before any message interpolates it.
+      const res = await proposePayout(payout.id, account, yocto);
+      if ('proposalId' in res) {
+        // Echo the advertised (free-text) reward next to the proposed amount:
+        // the admin resolves "50 USDC" to NEAR by hand, and the approver's
+        // verify-before-vote is the only control after this line.
+        await ctx.reply(
+          t(L, 'pay.proposed', {
+            taskId,
+            amount: amountArg,
+            account,
+            reward: payout.reward,
+            proposalId: res.proposalId,
+            url: proposalUrl(res.proposalId),
+          }),
+        );
+      } else {
+        // Submitted, but the gateway's proposal id didn't verify — don't print an
+        // id we can't trust; reconcile adopts the real one by description.
+        await ctx.reply(t(L, 'pay.submitted', { taskId, amount: amountArg, account, reward: payout.reward }));
+      }
+    } catch (err) {
+      await ctx.reply(errorMessage(err, t(L, 'pay.fail')));
+    }
+  });
+
+  // Contributor sets/views their standing DAO-push payout account (gated on
+  // DAO_CONTRACT_ID). Typed, not proof-backed — validated to exist on-chain.
+  // Usage: /payto <your.near>
+  bot.command('payto', async (ctx) => {
+    const L = localeOf(ctx);
+    if (!(await requirePrivateChat(ctx, 'common.privateOnly'))) return;
+    if (!config.daoContractId) return ctx.reply(t(L, 'payto.notEnabled'));
+    const account = commandArg(ctx);
+    // Disclose the on-chain-permanence consequence at the moment of setting (the
+    // prompt) AND on success — the same disclosure contract the Mini App and
+    // /privacy honor (payto.disclosure): a payout publishes this account + task
+    // id on the public chain, forever, beyond /forget.
+    if (!account) {
+      const current = await getPayoutAccount(ctx.from!.id);
+      const line = current ? t(L, 'payto.current', { account: current }) : t(L, 'payto.prompt');
+      return ctx.reply(`${line}\n${t(L, 'payto.disclosure')}`);
+    }
+    try {
+      await setPayoutAccount(ctx.from!.id, account);
+      await ctx.reply(`${t(L, 'payto.ok', { account })}\n${t(L, 'payto.disclosure')}`);
+    } catch (err) {
+      await ctx.reply(errorMessage(err, t(L, 'payto.fail')));
+    }
+  });
+
   // ---- Task status & history ----
   bot.command('status', async (ctx) => {
     const L = localeOf(ctx);
@@ -1055,27 +1511,40 @@ export function createBot(): Telegraf<BotContext> {
     callbackMutation(
       ctx,
       requireManageCb(() => getTask(Number(ctx.match[1]))),
-      // The announcement rows commit WITH the approval (nested withTransaction
-      // joins), because once a task is Open no path would ever announce it again
-      // — a lost enqueue would be permanent. A failure rolls the approval back,
-      // so the admin can simply tap Approve again. Approval still doesn't wait on
-      // Telegram: the background worker delivers the channel post and opt-in DMs
-      // after commit, globally rate-limited. The launch-scale audience read + row
-      // build happen BEFORE the transaction so they don't hold the task lock (and
-      // a pooled connection) across the whole fan-out — only the enqueue does.
+      // The announcement rows commit WITH the approval (callbackMutation's
+      // shared transaction), because once a task is Open no path would ever
+      // announce it again — a lost enqueue would be permanent. A failure rolls
+      // the approval back, so the admin can simply tap Approve again. Approval
+      // still doesn't wait on Telegram: the background worker delivers the
+      // channel post and opt-in DMs after commit, globally rate-limited. The
+      // launch-scale audience read + row build run BEFORE approveTask so the
+      // task lock never spans the whole fan-out build — only the enqueue does.
       async () => {
         const taskId = Number(ctx.match[1]);
         const draft = await getTask(taskId);
         const rows = draft ? await buildAnnounceRows(draft) : [];
-        return withTransaction(async () => {
-          const task = await approveTask(taskId, ctx.from!.id);
-          await enqueueAnnounceRows(rows);
-          return task;
-        });
+        const task = await approveTask(taskId, ctx.from!.id);
+        await enqueueAnnounceRows(rows);
+        return task;
       },
       async (task, L) => ({
         popup: t(L, 'approve.popup'),
         card: t(L, 'approve.opened', { detail: taskDetail(task, 0) }),
+      }),
+    ),
+  );
+
+  // The draft's other exit: delete it. Without this, the only way to clear a
+  // junk auto-draft from /approve is to PUBLISH it — announcing exactly the
+  // distilled group chatter the admin is rejecting (see discardDraft).
+  bot.action(/^discard:(\d+)$/, (ctx) =>
+    callbackMutation(
+      ctx,
+      requireManageCb(() => getTask(Number(ctx.match[1]))),
+      () => discardDraft(Number(ctx.match[1]), ctx.from!.id),
+      async (task, L) => ({
+        popup: t(L, 'approve.discardPopup'),
+        card: t(L, 'approve.discarded', { id: task.id }),
       }),
     ),
   );
@@ -1096,8 +1565,13 @@ export function createBot(): Telegraf<BotContext> {
       ctx,
       requireManageCb(() => taskOfApplication(Number(ctx.match[1]))),
       () => assignApplication(Number(ctx.match[1]), ctx.from!.id),
-      async ({ application, task }, L) => ({
-        enqueue: async () => notifyApplicant(application, task, 'assigned'),
+      async ({ application, task, filled }, L) => ({
+        enqueue: async () => {
+          await notifyApplicant(application, task, 'assigned');
+          // The last slot just went — the rest of the pool hears their wait
+          // changed shape instead of silently watching a full task.
+          if (filled && task) await notifyApplicantsTaskChanged(task, 'filled', application.id);
+        },
         popup: t(L, 'assign.popup'),
         card: t(L, 'assign.ok', { taskId: application.task_id }),
       }),
@@ -1122,11 +1596,13 @@ export function createBot(): Telegraf<BotContext> {
     await ctx.scene.enter(SCENES.submit, { applicationId: Number(ctx.match[1]) });
   });
 
-  // No gate: withdrawApplication itself refuses anyone but the owner.
+  // Ownership is enforced by withdrawApplication itself; the private-chat gate
+  // is for the card edit — a withdraw callback forged onto a group message
+  // would otherwise rewrite that shared message into a personal confirmation.
   bot.action(/^withdraw:(\d+)$/, (ctx) =>
     callbackMutation(
       ctx,
-      null,
+      requirePrivateCb,
       () => withdrawApplication(Number(ctx.match[1]), ctx.from!.id),
       async (app, L) => ({
         // no enqueue: withdrawing notifies no one today
@@ -1141,6 +1617,9 @@ export function createBot(): Telegraf<BotContext> {
   // Inbound Telegram text is ≤4096 chars, so this is one message today;
   // chunkMessage guards any future ingestion path that stores more.
   bot.action(/^full:(\d+)$/, async (ctx) => {
+    // Full-submission dumps are DM-only, like the review cards that carry the
+    // button — a group-side tap is forged and would post the work publicly.
+    if (!(await requirePrivateCb(ctx))) return;
     if (!(await requireManageCb(() => taskOfSubmission(Number(ctx.match[1])))(ctx))) return;
     const L = localeOf(ctx);
     const sub = await getSubmission(Number(ctx.match[1]));
@@ -1211,6 +1690,38 @@ export function createBot(): Telegraf<BotContext> {
     return { ok: true, key: on ? f.on : f.off };
   }
 
+  /**
+   * Why an enabled feature might still hear nothing: under Telegram's default
+   * privacy mode a bot in a group receives commands and replies but NOT plain
+   * member messages — signal detection never fires and AI-mode mentions go
+   * unseen, with no error or log anywhere (the listener simply never runs).
+   * Detectable: getMe's can_read_all_group_messages is false AND the bot is not
+   * an admin of THIS chat (group admins receive everything regardless). Returns
+   * the warning to append to an enable confirmation, or null when member
+   * messages actually reach the bot.
+   */
+  async function groupReceiveWarning(ctx: BotContext, L: string): Promise<string | null> {
+    if (ctx.botInfo?.can_read_all_group_messages) return null;
+    try {
+      const me = await ctx.telegram.getChatMember(ctx.chat!.id, ctx.botInfo.id);
+      if (me.status === 'administrator') return null;
+    } catch {
+      // Can't verify — warn anyway: a spurious hint beats a silently dead feature.
+    }
+    return t(L, 'rooms.receiveWarning');
+  }
+
+  /** An enable confirmation, with the receive warning appended when it applies. */
+  async function toggleReply(
+    ctx: BotContext,
+    L: string,
+    r: Awaited<ReturnType<typeof toggleRoomFeature>>,
+    on: boolean,
+  ): Promise<string> {
+    const warn = r.ok && on ? await groupReceiveWarning(ctx, L) : null;
+    return warn ? `${t(L, r.key)}\n\n${warn}` : t(L, r.key);
+  }
+
   // ---- /settings: one editable panel folding the room + notification toggles ----
   // In a group it exposes the room-admin toggles (signal detection, AI mode);
   // in a DM it exposes the contributor's task-announcement opt-in. Like
@@ -1249,25 +1760,54 @@ export function createBot(): Telegraf<BotContext> {
   });
 
   bot.action(/^set:(sig|ai|notify):(on|off)$/, async (ctx) => {
+    // Host provenance, same class-match rule as the pg: pager: act only when
+    // the host message actually carries settings buttons (the /settings panel
+    // or the /ai status card). Forged set: data on any other bot message —
+    // say, the shared task announcement — would otherwise apply the toggle and
+    // then editPage that message into the settings panel, destroying its Apply
+    // button for the whole room. Class-match, not exact: the panel's buttons
+    // flip between on/off states under concurrent taps.
+    if (!hostButtonData(ctx).some((d) => d.startsWith('set:'))) return void safeAnswerCb(ctx);
     const what = ctx.match[1];
     const on = ctx.match[2] === 'on';
     const L = localeOf(ctx);
-    if (what === 'notify') {
-      await setAnnounceOptIn(ctx.from!.id, on); // the tapper's own setting — no gate
-    } else {
-      // Room toggles are manager-only, enforced HERE since the panel is public.
-      const chatId = ctx.chat?.id;
-      if (chatId === undefined || !(await canManageRoom(ctx.from?.id, chatId))) {
-        return void safeAnswerCb(ctx, t(L, 'rooms.roomAdminsOnly'), { show_alert: true });
+    // Set when a room toggle succeeds: the group notice members deserve for a
+    // scanning change. Sent AFTER the callback is answered — the toggle has
+    // already been applied by then, and a bot muted in its own group must not
+    // leave the tapper's spinner hanging on the un-postable notice.
+    let groupNotice: (() => Promise<unknown>) | null = null;
+    // A throw anywhere in the mutation must still answer the callback (as an
+    // error popup) — the same contract pg: and callbackMutation hold.
+    try {
+      if (what === 'notify') {
+        // The tapper's own setting — no ROLE gate needed, but callback data is
+        // client-tamperable, so gate the CHAT TYPE like the other DM-only
+        // callbacks: a forged set:notify referencing a group message would
+        // otherwise editPage a shared announcement into a settings panel.
+        if (!(await requirePrivateCb(ctx))) return;
+        await setAnnounceOptIn(ctx.from!.id, on);
+      } else {
+        // Room toggles are manager-only, enforced HERE since the panel is public.
+        const chatId = ctx.chat?.id;
+        if (chatId === undefined || !(await canManageRoom(ctx.from?.id, chatId))) {
+          return void safeAnswerCb(ctx, t(L, 'rooms.roomAdminsOnly'), { show_alert: true });
+        }
+        // Self-heal the room row (legacy groups) before toggling, like the
+        // commands' gate does — a benign upsert, already manager-gated above.
+        await registerRoom(chatId, chatTitle(ctx), null);
+        const r = await toggleRoomFeature(chatId, what as 'sig' | 'ai', on);
+        if (!r.ok) return void safeAnswerCb(ctx, t(L, r.key), { show_alert: true });
+        const notice = await toggleReply(ctx, L, r, on);
+        groupNotice = () => ctx.reply(notice);
       }
-      // Self-heal the room row (legacy groups) before toggling, like the
-      // commands' gate does — a benign upsert, already manager-gated above.
-      await registerRoom(chatId, chatTitle(ctx), null);
-      const r = await toggleRoomFeature(chatId, what as 'sig' | 'ai', on);
-      if (!r.ok) return void safeAnswerCb(ctx, t(L, r.key), { show_alert: true });
-      await ctx.reply(t(L, r.key));
+    } catch (err) {
+      return void answerCbError(ctx, L, err);
     }
     await safeAnswerCb(ctx);
+    // The notice send is exactly what a send-restricted bot can't do — swallow
+    // its failure so the panel refresh below still reflects the applied toggle
+    // (a stale panel would offer the same action again, silently undoing it).
+    if (groupNotice) await groupNotice().catch(() => undefined);
     await editPage(ctx, await settingsPanel(ctx, L));
   });
 
@@ -1305,8 +1845,17 @@ export function createBot(): Telegraf<BotContext> {
     const now = upd.new_chat_member.status;
     if (LEFT.includes(was) && JOINED.includes(now)) {
       const inviterId = upd.from.is_bot ? null : upd.from.id;
-      await registerRoom(chat.id, chat.title ?? null, inviterId);
+      const { inviterBecameAdmin } = await registerRoom(chat.id, chat.title ?? null, inviterId);
       await notifyRoomRegistered(chat.id, chat.title ?? null, inviterId, upd.date);
+      // The join must not be silent: greet the group with what the bot does and
+      // where to switch it on, and DM the inviter that they are now this room's
+      // first admin (previously nobody ever told them — the room bootstrap was
+      // invisible without reading the README). Both queued and best-effort; the
+      // DM 403s harmlessly if the inviter never started the bot.
+      await notifyRoomWelcome(chat.id, upd.date);
+      if (inviterBecameAdmin && inviterId !== null) {
+        await notifyRoomAdminPromoted(inviterId, chat.id, chat.title ?? null, upd.date);
+      }
     } else if (JOINED.includes(was) && LEFT.includes(now)) {
       // Kicked/left: stop scanning AND stop answering. The room row and its
       // admins stay — they are provenance for existing tasks, and re-adding the
@@ -1325,13 +1874,39 @@ export function createBot(): Telegraf<BotContext> {
     }
   });
 
+  // A group upgraded to a supergroup gets a NEW chat id, announced only by a
+  // service message on each side of the rename (my_chat_member does not fire —
+  // the bot's membership never changed). Everything keyed by chat id must
+  // follow, or the room silently goes dark and its admins are locked out (the
+  // manager gate keys off the room row they'd need to re-create). Both sides
+  // funnel into the same idempotent rewrite; whichever update arrives first
+  // does the work and the other finds nothing left to move.
+  // On failure, log BOTH ids before rethrowing to bot.catch: the service
+  // messages are consumed either way, so this breadcrumb is what makes a
+  // stranded room manually recoverable from the logs.
+  const runMigration = async (oldId: number, newId: number): Promise<void> => {
+    try {
+      await migrateRoomChat(oldId, newId);
+    } catch (err) {
+      console.error(`[rooms] MIGRATION FAILED ${oldId} → ${newId}:`, err instanceof Error ? err.message : err);
+      throw err;
+    }
+  };
+  bot.on(message('migrate_to_chat_id'), async (ctx) => {
+    console.log(`[rooms] group ${ctx.chat.id} upgraded to supergroup ${ctx.message.migrate_to_chat_id}`);
+    await runMigration(ctx.chat.id, ctx.message.migrate_to_chat_id);
+  });
+  bot.on(message('migrate_from_chat_id'), async (ctx) => {
+    await runMigration(ctx.message.migrate_from_chat_id, ctx.chat.id);
+  });
+
   bot.command('enablesignals', async (ctx) => {
     const L = localeOf(ctx);
     if (!(await requireGroupCmd(ctx)) || !(await requireRoomManagerCmd(ctx))) return;
     // The success reply lands in the group — deliberate: it is the members'
     // notice that their messages are now AI-scored (and that nothing is stored).
     const r = await toggleRoomFeature(ctx.chat!.id, 'sig', true);
-    return ctx.reply(t(L, r.key));
+    return ctx.reply(await toggleReply(ctx, L, r, true));
   });
 
   bot.command('disablesignals', async (ctx) => {
@@ -1360,13 +1935,23 @@ export function createBot(): Telegraf<BotContext> {
     if (!(await requireGroupCmd(ctx))) return;
     const arg = commandArg(ctx)?.toLowerCase();
     if (arg === 'status' || arg === undefined) {
+      // Tapping /ai from the group command menu sends the BARE command (menus
+      // can't carry arguments), so this status reply is the only thing a
+      // menu-tapper ever reaches — carry the toggle button (same manager-gated
+      // set:ai callback as /settings) or the menu path can never enable AI mode.
       const room = await getRoom(ctx.chat!.id);
-      return ctx.reply(t(L, 'ai.status', { on: room?.ai_enabled === 1 }));
+      const on = room?.ai_enabled === 1;
+      return ctx.reply(
+        t(L, 'ai.status', { on }),
+        Markup.inlineKeyboard([
+          [Markup.button.callback(t(L, on ? 'btn.aiModeOff' : 'btn.aiModeOn'), `set:ai:${on ? 'off' : 'on'}`)],
+        ]),
+      );
     }
     if (arg !== 'on' && arg !== 'off') return ctx.reply(t(L, 'ai.usage'));
     if (!(await requireRoomManagerCmd(ctx))) return;
     const r = await toggleRoomFeature(ctx.chat!.id, 'ai', arg === 'on');
-    return ctx.reply(t(L, r.key));
+    return ctx.reply(await toggleReply(ctx, L, r, arg === 'on'));
   });
 
   /** The replied-to user on a /addroomadmin- or /removeroomadmin-style command, or null. */
@@ -1434,6 +2019,14 @@ export function createBot(): Telegraf<BotContext> {
   // feed signal detection. Requires the bot to actually receive group texts:
   // either privacy mode off, or the bot promoted to admin in that group.
   bot.on('text', (ctx) => {
+    // A DM reaching this catch-all matched nothing: no command handler took it
+    // and no wizard is active (a live scene consumes its updates upstream). The
+    // common real case is a pitch or submission typed after a redeploy dropped
+    // the RAM-only wizard session — silence there reads as a broken bot, so
+    // point back at the entry points. (Also catches typo'd commands.)
+    if (ctx.chat?.type === 'private') {
+      return void ctx.reply(t(localeOf(ctx), 'common.dmLost'));
+    }
     if (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') return;
     if (ctx.from?.is_bot) return;
     const text = ctx.message.text;
@@ -1459,6 +2052,14 @@ export function createBot(): Telegraf<BotContext> {
       if (addressed && userId !== undefined) {
         const room = await getRoom(chatId);
         if (room?.ai_enabled === 1) {
+          // The per-room hourly budget (mirroring the signal path's
+          // claimSignalSlot) is claimed BEFORE any model spend. Over budget:
+          // one notice per window, then silence — never a reply per spam message.
+          const slot = claimAgentSlot(chatId);
+          if (!slot.allowed) {
+            if (slot.notify) await ctx.reply(t(localeOf(ctx), 'agent.budget'));
+            return;
+          }
           const env: AgentEnv = {
             userId,
             roomChatId: chatId,
@@ -1479,6 +2080,21 @@ export function createBot(): Telegraf<BotContext> {
     });
   });
 
+  // The text fallback above never sees media — Telegram puts a caption, not
+  // text, on photo/file/video messages, so they match no handler at all. In a
+  // private chat that silence hits the same person the dmLost signpost exists
+  // for, in their most likely form: a contributor whose /submit wizard was
+  // dropped by a redeploy sending the screenshot itself. Give media the same
+  // pointer back to the entry points. (Group media stays unhandled — ambient.)
+  bot.on('message', (ctx) => {
+    if (ctx.chat?.type !== 'private') return;
+    // Service messages aren't something the user "sent" — pinning the bot's own
+    // task card must not earn them a "your message got lost" reply.
+    const m = ctx.message as unknown as Record<string, unknown>;
+    if ('pinned_message' in m || 'message_auto_delete_timer_changed' in m) return;
+    return void ctx.reply(t(localeOf(ctx), 'common.dmLost'));
+  });
+
   bot.catch((err, ctx) => {
     console.error(`[bot] error handling ${ctx.updateType}:`, err instanceof Error ? err.message : err);
   });
@@ -1494,8 +2110,11 @@ export const CONTRIBUTOR_COMMANDS: { command: string; description: string }[] = 
   { command: 'withdraw', description: 'Withdraw an application' },
   { command: 'notify', description: 'Turn task-announcement DMs on/off' },
   { command: 'settings', description: 'Your notification settings' },
+  { command: 'payto', description: 'Set the NEAR account your payouts go to' },
+  { command: 'payouts', description: 'Your payouts — money owed to you (admins: the queue)' },
   { command: 'status', description: 'View a task and its history' },
   { command: 'privacy', description: 'What this bot stores about you' },
+  { command: 'terms', description: 'The terms of use, in plain language' },
   { command: 'help', description: 'Show help' },
 ];
 
@@ -1528,6 +2147,9 @@ export const ADMIN_COMMANDS: { command: string; description: string }[] = [
   { command: 'close', description: 'Stop accepting applications (admin)' },
   { command: 'reopen', description: 'Reopen for applications (admin)' },
   { command: 'unassign', description: 'Remove an assignment (admin)' },
-  { command: 'payouts', description: 'Payout funding queue (admin)' },
+  { command: 'payouts', description: 'Payout settlement queue (admin)' },
+  { command: 'pay', description: 'Propose a DAO payout for a task (admin)' },
+  { command: 'stats', description: 'Funnel stats — is the loop working? (admin)' },
+  { command: 'diag', description: 'Config preflight — is everything wired? (admin)' },
   { command: 'forget', description: 'Erase a contributor’s data (admin)' },
 ];

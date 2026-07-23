@@ -28,6 +28,11 @@ export async function countSince(roomChatId: number, sinceIso: string): Promise<
   ]))!.n;
 }
 
+/** Evaluations claimed across ALL rooms since `sinceIso` (the global spend cap read). */
+export async function countAllSince(sinceIso: string): Promise<number> {
+  return (await one<{ n: number }>('SELECT COUNT(*) AS n FROM signals WHERE created_at >= $1', [sinceIso]))!.n;
+}
+
 export async function finish(
   id: number,
   score: number | null,
@@ -40,6 +45,18 @@ export async function finish(
     taskId,
     nowIso(),
     id,
+  ]);
+}
+
+/** A drafted signal whose draft a human then discarded: close it out as
+ *  'discarded' — the room tally reports the pipeline's NET outcome, and a
+ *  drafted-then-rejected signal produced nothing — and drop the pointer to the
+ *  task row being deleted (the FK would block the delete). Score stays: it
+ *  measured the message, not the human decision. */
+export async function discardDrafted(taskId: number): Promise<void> {
+  await run(`UPDATE signals SET status = 'discarded', task_id = NULL, updated_at = $2 WHERE task_id = $1`, [
+    taskId,
+    nowIso(),
   ]);
 }
 
@@ -59,6 +76,18 @@ export async function reclaimEvaluating(): Promise<number> {
 export interface SignalCounts {
   drafted: number;
   discarded: number;
+}
+
+/** The room a signal currently belongs to — re-read at draft time because a
+ *  chat migration may have moved it since the evaluation began. */
+export async function roomOf(signalId: number): Promise<number | undefined> {
+  return (await one<{ room_chat_id: number }>('SELECT room_chat_id FROM signals WHERE id = $1', [signalId]))?.room_chat_id;
+}
+
+/** Group → supergroup migration: re-point signal history at the successor
+ *  chat id (see service.migrateRoomChat for the FK-ordered sequence). */
+export async function moveRoom(oldChatId: number, newChatId: number): Promise<number> {
+  return run('UPDATE signals SET room_chat_id = $1 WHERE room_chat_id = $2', [newChatId, oldChatId]);
 }
 
 /** Lifetime drafted/discarded tallies for a room (the /signalstatus surface). */

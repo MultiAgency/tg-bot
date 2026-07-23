@@ -36,11 +36,16 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
       - run: npm ci
-      # Full gate: typecheck, build, then all five demo suites (core-demo, demo,
-      # queue-demo, edge-demo, rooms-demo) — service-layer edge cases, the
-      # end-to-end bot loop, queue delivery semantics, adversarial edges (Telegram
-      # size limits, group privacy, erasure races), and rooms/signal detection.
-      # Each drives real code against the Postgres service above, with a stubbed
-      # network and a per-run scratch schema; the npm scripts set their own dummy
-      # env, so no real token or AI key is needed.
+      # Full gate: typecheck (bot + web), build, then every demo/smoke suite
+      # (dao-check, core-demo, demo, queue-demo, edge-demo, rooms-demo,
+      # agent-tools-demo, dao-demo, web-smoke) — service-layer edge cases, the
+      # end-to-end bot loop, queue delivery semantics, adversarial edges
+      # (Telegram size limits, group privacy, erasure races), rooms/signal
+      # detection, the agent's tool guards, the DAO-push settlement walk (RPC
+      # stubbed), and the Mini App tier. Each drives real code against the
+      # Postgres service above, with a stubbed network and a per-run scratch
+      # schema; the npm scripts set their own dummy env, so no real token or AI
+      # key is needed. (Live-NEAR positive paths — a real payout-account set,
+      # the OutLayer submit — are not in the gate at all; they live in the
+      # hand-run dao-*-live scripts. See README's coverage note.)
       - run: npm test

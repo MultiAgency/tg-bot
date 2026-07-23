@@ -154,6 +154,89 @@ export function nowIso(): string {
   return new Date().toISOString();
 }
 
+// ---- Session-scoped advisory locks (single-writer leadership) ----
+
+/**
+ * A held session-level advisory lock. Postgres releases it automatically when
+ * the holding connection dies — which is exactly the leadership semantics the
+ * notification worker needs: a crashed or killed holder frees the lock without
+ * any cleanup code running.
+ */
+export interface SessionLock {
+  /** Cheap liveness probe on the lock's own connection. Returns false — and
+   *  destroys the connection — once the lock is gone (connection died); the
+   *  holder must stop acting as leader and re-acquire. */
+  heartbeat(): Promise<boolean>;
+  release(): Promise<void>;
+}
+
+/**
+ * Try to take a session advisory lock, or return null if another connection
+ * holds it. Non-blocking by design: the caller polls, it never queues.
+ *
+ * The lock key is paired with a per-process discriminator under TEST_SCHEMA:
+ * advisory locks are DATABASE-global while the demo suite isolates each process
+ * into its own schema — without the discriminator, two demos sharing the test
+ * database would serialize on a lock that guards nothing between them (their
+ * data never overlaps). Production (TEST_SCHEMA null) uses discriminator 0, so
+ * every instance of a deploy contends on the same lock — the point.
+ */
+export async function tryAcquireSessionLock(key: number): Promise<SessionLock | null> {
+  const discriminator = TEST_SCHEMA ? process.pid : 0;
+  const client = await pool.connect();
+  let dead = false;
+  // A dropped lock connection must not crash the process (same rule as the
+  // pool's idle handler); it just means leadership was lost.
+  const onError = () => {
+    dead = true;
+  };
+  client.on('error', onError);
+  let destroyed = false;
+  const destroy = (): void => {
+    // Idempotent: heartbeat() destroys on failure and release() may run after —
+    // pg throws on a second client.release().
+    if (destroyed) return;
+    destroyed = true;
+    client.removeListener('error', onError);
+    // Truthy release() arg destroys the connection instead of pooling it —
+    // correct for a dead client, and for a live one it guarantees the session
+    // (and with it the lock) actually ends rather than lingering in the pool.
+    client.release(true);
+  };
+  try {
+    const got = await client.query<{ ok: boolean }>('SELECT pg_try_advisory_lock($1, $2) AS ok', [key, discriminator]);
+    if (!got.rows[0]?.ok) {
+      destroy();
+      return null;
+    }
+  } catch (err) {
+    destroy();
+    throw err;
+  }
+  return {
+    async heartbeat(): Promise<boolean> {
+      if (dead) {
+        destroy();
+        return false;
+      }
+      try {
+        await client.query('SELECT 1');
+        return !dead;
+      } catch {
+        dead = true;
+        destroy();
+        return false;
+      }
+    },
+    async release(): Promise<void> {
+      if (!dead) {
+        await client.query('SELECT pg_advisory_unlock($1, $2)', [key, discriminator]).catch(() => undefined);
+      }
+      destroy();
+    },
+  };
+}
+
 export async function closePool(): Promise<void> {
   await pool.end();
 }

@@ -5,12 +5,13 @@ import {
   messageText,
   wizardState,
   handledWizardInterrupt,
+  finishScene,
   isCommand,
   requirePrivateChat,
 } from '../context.js';
 import * as ai from '../../ai/assist.js';
 import { shutdownSignal } from '../background.js';
-import { createTask } from '../../core/service.js';
+import { createTask, errorMessage } from '../../core/service.js';
 import { MAX_ASSIGNEES, isValidMaxAssignees } from '../../core/workflow.js';
 import { taskDetail } from '../format.js';
 import { t, localeOf } from '../i18n.js';
@@ -70,7 +71,7 @@ export const newTaskScene = new Scenes.WizardScene<BotContext>(
   async (ctx) => {
     const L = localeOf(ctx);
     const text = messageText(ctx);
-    if (await handledWizardInterrupt(ctx, text, { allow: ['ai'] })) return;
+    if (await handledWizardInterrupt(ctx, text, { allowAi: true })) return;
     if (!text) {
       await ctx.reply(t(L, 'nt.descriptionText'));
       return;
@@ -121,7 +122,7 @@ export const newTaskScene = new Scenes.WizardScene<BotContext>(
   async (ctx) => {
     const L = localeOf(ctx);
     const text = messageText(ctx);
-    if (await handledWizardInterrupt(ctx, text, { allow: ['ai'] })) return;
+    if (await handledWizardInterrupt(ctx, text, { allowAi: true })) return;
     if (!text) {
       await ctx.reply(t(L, 'nt.outputText'));
       return;
@@ -161,16 +162,23 @@ export const newTaskScene = new Scenes.WizardScene<BotContext>(
       st.maxAssignees = n;
     }
 
-    const task = await createTask({
-      title: st.title!,
-      description: st.description!,
-      reward: st.reward ?? null,
-      deadline: st.deadline ?? null,
-      requiredOutput: st.requiredOutput ?? null,
-      maxAssignees: st.maxAssignees ?? 1,
-      createdBy: ctx.from!.id,
-    });
-    await ctx.reply(t(L, 'nt.created', { detail: taskDetail(task) }));
-    return ctx.scene.leave();
+    // finishScene owns reply-and-leave on every path (a throw must not strand
+    // the admin in the wizard; a created task must not invite a duplicating
+    // "retry" when the confirmation send fails).
+    return finishScene(
+      ctx,
+      () =>
+        createTask({
+          title: st.title!,
+          description: st.description!,
+          reward: st.reward ?? null,
+          deadline: st.deadline ?? null,
+          requiredOutput: st.requiredOutput ?? null,
+          maxAssignees: st.maxAssignees ?? 1,
+          createdBy: ctx.from!.id,
+        }),
+      (task) => ctx.reply(t(L, 'nt.created', { detail: taskDetail(task) })),
+      (err) => ctx.reply(errorMessage(err, t(L, 'nt.fail'))),
+    );
   },
 );

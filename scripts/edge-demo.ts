@@ -219,7 +219,17 @@ async function main(): Promise<void> {
   const edits = since(mark).filter((o) => o.method === 'editMessageText' && o.chatId === CARA);
   assert.equal(edits.length, 1, 'Next edits the card in place — one editMessageText, no new card');
   assert.ok(edits[0].text !== firstCard.text, 'the paginator now shows a different task');
-  ok('paginator flips the card in place — no message spam');
+  // A FORGED pg: callback attached to a non-paginator bot message (e.g. the
+  // shared group announcement, whose keyboard is a deep-link Apply) must not
+  // rewrite it — the handler edits only a host whose server-attested keyboard
+  // is a paginator's.
+  mark = outbound.length;
+  await tap(CARA, 'pg:open:0:1', groupChat, [[{ text: 'Apply', url: 'https://t.me/DemoBot?start=t2' }]]);
+  assert.ok(
+    !since(mark).some((o) => o.method === 'editMessageText'),
+    'a forged pg: callback on a non-paginator message edits nothing',
+  );
+  ok('paginator flips the card in place — no message spam; forged pg: callbacks refused');
   mark = outbound.length;
   await say(CARA, '/start t2');
   assert.ok(repliesTo(mark, CARA).some((o) => o.text.startsWith('Applying to #2')), 'deep link opens the apply wizard');
@@ -242,6 +252,26 @@ async function main(): Promise<void> {
   const queuedPhoto = since(mark).find((o) => o.method === 'sendPhoto' && o.chatId === ADMIN && o.fileId === 'PH-FINAL');
   assert.ok(queuedPhoto, 'worker delivered the media notification through sendMedia');
   ok('same file_id + caption via the inline path and the queue worker');
+
+  // -------------------------------------------------------------------------
+  step('4b. Manager-card callbacks forged into a group are refused (DM-only)');
+  // These cards (full submission, review pages, applicant/active pages) are only
+  // ever POSTED in DMs — a matching callback arriving from a group is forged
+  // onto some group message. Even from a REAL manager it must refuse: the render
+  // would dump contributor submissions/pitches/names into the group (the same
+  // reason the command-side twins are private-gated in step 3).
+  mark = outbound.length;
+  await tap(ADMIN, 'full:1', groupChat);
+  await tap(ADMIN, 'rev:more:0', groupChat);
+  await tap(ADMIN, 'pg:appl:2:0', groupChat);
+  await tap(ADMIN, 'pg:actv:0:0', groupChat);
+  assert.ok(!since(mark).some((o) => o.chatId === GROUP), 'nothing was posted into the group');
+  assert.ok(!since(mark).some((o) => o.method === 'editMessageText'), 'no group card was rewritten into a manager page');
+  assert.ok(
+    since(mark).filter((o) => o.method === 'answerCallbackQuery').every((o) => o.text.includes('private chat')),
+    'each forged tap got the private-chat popup',
+  );
+  ok('full:/rev:more:/pg:appl/pg:actv all refuse group-side taps before any render');
 
   // -------------------------------------------------------------------------
   step('5. /forget mid-batch: claimed-but-erased rows are not delivered');

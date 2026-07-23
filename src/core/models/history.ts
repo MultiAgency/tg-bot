@@ -53,6 +53,13 @@ export function contributorDetail(contributorId: number, reason?: string): strin
   return `contributor ${contributorId}${reason ? `: ${reason}` : ''}`;
 }
 
+/** Drop a task's entire audit trail — discardDraft only: a deleted draft's
+ *  history would orphan on the tasks FK, and a never-published draft's trail
+ *  (its 'created' row) has nothing to audit. */
+export async function deleteByTask(taskId: number): Promise<void> {
+  await run('DELETE FROM task_history WHERE task_id = $1', [taskId]);
+}
+
 // id tiebreaks rows written in the same transaction (identical created_at).
 export async function listHistory(taskId: number): Promise<HistoryEntry[]> {
   return many<HistoryEntry>('SELECT * FROM task_history WHERE task_id = $1 ORDER BY created_at ASC, id ASC', [taskId]);

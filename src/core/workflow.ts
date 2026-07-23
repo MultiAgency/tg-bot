@@ -52,15 +52,6 @@ export const SubmissionStatus = {
 } as const;
 export type SubmissionStatus = (typeof SubmissionStatus)[keyof typeof SubmissionStatus];
 
-const TASK_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
-  [TaskStatus.Draft]: [TaskStatus.Open],
-  [TaskStatus.Open]: [TaskStatus.Closed],
-  [TaskStatus.Closed]: [TaskStatus.Open],
-};
-
-export const canTaskTransition = (from: TaskStatus, to: TaskStatus): boolean =>
-  TASK_TRANSITIONS[from]?.includes(to) ?? false;
-
 /** How many contributors one task can have assigned at once. */
 export const MAX_ASSIGNEES = 100;
 

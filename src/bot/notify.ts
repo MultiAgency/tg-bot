@@ -6,6 +6,9 @@ import { isMediaSubmission, type Submission, type MediaSubmissionType } from '..
 import type { MediaKind } from '../core/models/notification.js';
 import {
   listAnnounceRecipients,
+  listApplicantsAwaiting,
+  listStaleAssignments,
+  listTasksByIds,
   getContributorForUpdate,
   taskManagerIds,
   type Contributor,
@@ -13,8 +16,8 @@ import {
 } from '../core/service.js';
 import { withTransaction } from '../core/db.js';
 import { enqueue, enqueueMany, type NewNotification } from '../core/models/notification.js';
-import { submissionReviewCard, applicantCard, taskLine, clampMessage, clampCaption } from './format.js';
-import { reviewButtons, applicantButtons, deepLinkApplyButton } from './keyboards.js';
+import { submissionReviewCard, applicantCard, taskLine, taskDetail, clampMessage, clampCaption } from './format.js';
+import { reviewButtons, applicantButtons, deepLinkApplyButton, draftButtons } from './keyboards.js';
 import { sendMedia } from './worker.js';
 import { t, contributorLocale, contributorLocales, baseCode } from './i18n.js';
 
@@ -24,6 +27,20 @@ import { t, contributorLocale, contributorLocales, baseCode } from './i18n.js';
  * limited and with retries. Producers only touch the DB (locale lookups + the
  * insert), so callers can await them cheaply or fire-and-forget the fan-outs.
  */
+
+// ANNOUNCE_CHAT_ID accepts an @username, but rooms are keyed by numeric chat id
+// — so the room-vs-announce-channel double-post guard below can only work if the
+// @username form is resolved to its id. index.ts does one getChat at boot and
+// records it here; unresolved (boot lookup failed / plain numeric config) stays
+// null and the guard falls back to comparing the raw config string.
+let announceChatNumericId: string | null = null;
+export function setAnnounceChatNumericId(id: number): void {
+  announceChatNumericId = String(id);
+}
+/** True when `chatId` (numeric room id) IS the configured announce chat. */
+function isAnnounceChat(chatId: number): boolean {
+  return String(chatId) === config.announceChatId || String(chatId) === announceChatNumericId;
+}
 
 /** Serialize an inline keyboard to the reply_markup JSON the worker replays. */
 function markup(kb: { reply_markup: unknown }): string {
@@ -175,13 +192,22 @@ export async function notifyContributorReview(
   decision: ReviewDecision,
   note: string | null,
 ): Promise<void> {
-  await enqueueAboutContributor(contributorId, async (_c, L) => {
+  await enqueueAboutContributor(contributorId, async (c, L) => {
     // Raw parts only — the catalog composes the sentence (fallback wording for a
     // missing task, the note line) so every fragment is translatable.
     const p = { taskId: task?.id ?? null, title: task?.title ?? '', note };
     let text: string;
     if (decision === 'approve') {
       text = t(L, 'notify.reviewApproved', { ...p, reward: task?.reward ?? null });
+      // The funnel's missing link: approval mints a payout the contributor can't
+      // receive without a saved NEAR account, and nothing else ever tells them
+      // /payto exists — the money would strand with an admin chasing them
+      // out-of-band. Nudge exactly when it matters: rewarded work, DAO rail on,
+      // no account saved yet. Read off the locked row the wrapper hands us —
+      // its whole contract is "no second read of the contributor".
+      if (config.daoContractId && task?.reward && c.payout_account === null) {
+        text += `\n\n${t(L, 'notify.paytoNudge')}`;
+      }
     } else if (decision === 'reject') {
       text = t(L, 'notify.reviewRejected', p);
     } else {
@@ -221,6 +247,103 @@ export async function notifyApplicant(app: Application, task: Task | undefined, 
   });
 }
 
+/**
+ * DM every still-Applied applicant that the shape of their wait changed:
+ * `filled` — the last slot was just assigned, so they'd otherwise keep waiting
+ * on a full task with no signal (they stay in the pool: an unassign can free a
+ * slot); `closed` — the task closed before their application was decided, and
+ * apply/assign both require an Open task, so nothing happens unless it reopens.
+ * Dedup is per-application and once-ever: a task that refills after an
+ * unassign, or re-closes after a reopen, does not re-DM the same applicant —
+ * one status nudge per application is signal, a stream of them is noise.
+ */
+export async function notifyApplicantsTaskChanged(
+  task: Task,
+  change: 'filled' | 'closed',
+  excludeApplicationId?: number,
+): Promise<void> {
+  const waiting = (await listApplicantsAwaiting(task.id)).filter((a) => a.id !== excludeApplicationId);
+  for (const app of waiting) {
+    await enqueueAboutContributor(app.contributor_id, async (_contributor, L) => {
+      await enqueue({
+        dedupKey: `task-${change}:${app.id}`,
+        chatId: String(app.contributor_id),
+        subjectId: app.contributor_id,
+        text: clampMessage(
+          t(L, change === 'filled' ? 'notify.taskFilled' : 'notify.taskClosed', {
+            taskId: task.id,
+            title: task.title,
+          }),
+        ),
+      });
+    });
+  }
+}
+
+/**
+ * A contributor's /forgetme filed an erasure request — alert every global admin
+ * (erasure itself stays a human-run /forget, money-in-flight guard and all;
+ * this closes the "petition a human out-of-band" gap, not the human step).
+ * Dedup is per contributor per UTC day: same-day re-requests are suppressed,
+ * a request re-filed later (e.g. after asking why nothing happened) goes out.
+ */
+export async function notifyErasureRequest(contributorId: number, username: string | null): Promise<void> {
+  // Under the contributor's erasure lock like every PII producer whose subject
+  // is guaranteed to exist (the private-chat middleware upserted the filer): a
+  // /forget committing between the tap and this enqueue must suppress the
+  // alert, not mint fresh rows naming a just-erased person that the purge
+  // already swept past.
+  await enqueueAboutContributor(contributorId, async () => {
+    const day = new Date().toISOString().slice(0, 10);
+    await enqueueForAdmins(contributorId, (adminId, L) => [
+      {
+        dedupKey: `forgetme:${contributorId}:${day}:${adminId}`,
+        text: clampMessage(t(L, 'notify.erasureRequest', { contributorId, username })),
+      },
+    ]);
+  });
+}
+
+/**
+ * Pre-stale nudge sweep (run from the worker's leader maintenance cadence, via
+ * setStaleNudger): assignments quietly approaching config.staleAssignedDays get
+ * ONE reminder before they surface in /admin's stale count and reach /unassign
+ * territory — without it, the first staleness signal a drifting assignee ever
+ * receives is the unassignment DM. Nudges at max(1, staleDays − 2). Once per
+ * assignment stint: the dedup key carries updated_at, which moves on every
+ * status change (a re-assign after an unassign is a new stint and a fresh
+ * nudge) and holds still within one.
+ */
+export async function nudgeStaleAssignments(stopped: () => boolean = () => false): Promise<void> {
+  const nudgeDays = Math.max(1, config.staleAssignedDays - 2);
+  const rows = await listStaleAssignments(nudgeDays);
+  if (rows.length === 0) return;
+  const titles = new Map(
+    (await listTasksByIds([...new Set(rows.map((a) => a.task_id))])).map((tk) => [tk.id, tk.title]),
+  );
+  for (const app of rows) {
+    // Interruptible between rows: this runs inside the delivery worker's tick,
+    // and shutdown awaits that tick — an unbounded sweep would otherwise hold
+    // SIGTERM past the grace window (the shutdown comment's "internally
+    // bounded" promise). Unswept rows are re-found next window (dedup-keyed).
+    if (stopped()) return;
+    await enqueueAboutContributor(app.contributor_id, async (_contributor, L) => {
+      await enqueue({
+        dedupKey: `stale-nudge:${app.id}:${app.updated_at}`,
+        chatId: String(app.contributor_id),
+        subjectId: app.contributor_id,
+        text: clampMessage(
+          t(L, 'notify.staleNudge', {
+            taskId: app.task_id,
+            title: titles.get(app.task_id) ?? '',
+            days: nudgeDays,
+          }),
+        ),
+      });
+    });
+  }
+}
+
 /** Alert every manager that an application arrived, with one-tap Assign/Decline buttons. */
 export async function notifyAdminsOfApplication(app: Application, task: Task | undefined): Promise<void> {
   await enqueueAboutContributor(app.contributor_id, async (contributor) => {
@@ -241,13 +364,17 @@ export async function notifyAdminsOfApplication(app: Application, task: Task | u
 }
 
 /**
- * Build the notification rows for a newly opened task: the announcement channel
- * post (if configured — the primary, O(1) discovery surface, with a deep-link
- * Apply button when the bot @username is known) plus the opt-in DM fan-out
- * (contributors who ran /notify on). Does the audience SELECT and row
- * construction with NO transaction, so a caller can run this launch-scale work
- * OUTSIDE the approval lock and enqueue the result atomically afterward (see
- * enqueueAnnounceRows). Both surfaces are best-effort; /open stays canonical.
+ * Build the notification rows for a newly opened task. Room-scoped by the same
+ * contract as service.listOpenTasks: a room task announces ONLY into its own
+ * group — never the global announce channel or the /notify-on DM fan-out — so
+ * a stranger's self-registered room can only ever address itself. A global
+ * (no-room) task gets the full megaphone: the announcement channel (if
+ * configured — the primary O(1) discovery surface, with a deep-link Apply
+ * button when the bot @username is known) plus the opt-in DMs. Does the
+ * audience SELECT and row construction with NO transaction, so a caller can
+ * run this launch-scale work OUTSIDE the approval lock and enqueue the result
+ * atomically afterward (see enqueueAnnounceRows). Best-effort; /open stays
+ * canonical.
  *
  * Safe to build from the pre-approval (Draft) task snapshot: only the status
  * flips on approval, and none of the announced fields (title/reward/deadline)
@@ -256,11 +383,13 @@ export async function notifyAdminsOfApplication(app: Application, task: Task | u
 export async function buildAnnounceRows(task: Task): Promise<NewNotification[]> {
   const line = taskLine(task);
   const rows: NewNotification[] = [];
-  // A room-scoped task (drafted from — or created for — a group) announces back
-  // INTO that group on approval, so the community whose discussion produced it
-  // actually sees the opportunity. Task-only content (taskLine carries no PII).
-  // Skipped when the room IS the global announce channel, to avoid double-posting.
-  if (task.room_chat_id != null && String(task.room_chat_id) !== config.announceChatId) {
+  // A room task announces back INTO its group on approval, so the community
+  // whose discussion produced it sees the opportunity — and nowhere else.
+  // Task-only content (taskLine carries no PII). A room that IS the global
+  // announce channel falls through to the global fan-out instead: it is the
+  // operator's own community, and the room row would double-post (isAnnounceChat
+  // also matches the @username form via the boot-time resolution).
+  if (task.room_chat_id != null && !isAnnounceChat(task.room_chat_id)) {
     rows.push({
       dedupKey: `announce-room:${task.id}`,
       chatId: String(task.room_chat_id),
@@ -268,6 +397,7 @@ export async function buildAnnounceRows(task: Task): Promise<NewNotification[]> 
       text: clampMessage(t('en', 'notify.announceRoom', { line })),
       replyMarkup: config.botUsername ? markup(deepLinkApplyButton(task, config.botUsername, 'en')) : null,
     });
+    return rows;
   }
   if (config.announceChatId) {
     rows.push({
@@ -307,13 +437,36 @@ export async function enqueueAnnounceRows(rows: NewNotification[]): Promise<void
  * content (the AI-distilled draft names no contributor) — subjectId null.
  */
 export async function notifySignalDraft(task: Task, roomTitle: string | null): Promise<void> {
-  const line = taskLine(task);
+  // The alert IS the approve card: full draft detail + the same approve:<id>
+  // button /approve renders (auth re-checked on tap), so acting on a draft is
+  // one tap from the DM — not "run /approve, then tap" (the double-approve the
+  // pilot flagged). /approve stays as the queue view for drafts left sitting.
+  const detail = taskDetail(task, 0);
   await enqueueForManagers(task, null, (managerId, L) => [
     {
       dedupKey: `signal-draft:${task.id}:${managerId}`,
-      text: clampMessage(t(L, 'notify.signalDraft', { line, room: roomTitle })),
+      text: clampMessage(t(L, 'notify.signalDraft', { detail, room: roomTitle })),
+      replyMarkup: markup(draftButtons(task, L)),
     },
   ]);
+}
+
+/**
+ * Greet the group the bot was just added to. Without this the join is silent —
+ * the bot posts nothing, only global admins hear about it, and the room's first
+ * likely action (/enablesignals under default privacy mode) fails invisibly —
+ * so the group product was unreachable without reading the README. Task-only
+ * chrome, group locale unknown → 'en' (like announceRoom). Queued, not sent
+ * inline: my_chat_member has no message to reply to, and the outbox absorbs a
+ * send-restricted group gracefully.
+ */
+export async function notifyRoomWelcome(chatId: number, eventDate: number): Promise<void> {
+  await enqueue({
+    dedupKey: `room-welcome:${chatId}:${eventDate}`,
+    chatId: String(chatId),
+    subjectId: null,
+    text: clampMessage(t('en', 'rooms.welcome', { username: config.botUsername || null })),
+  });
 }
 
 /**
@@ -346,6 +499,54 @@ export async function notifyRoomAdminPromoted(userId: number, chatId: number, ro
     subjectId: userId,
     text: clampMessage(t(await contributorLocale(userId), 'notify.roomAdminPromoted', { title: roomTitle })),
   });
+}
+
+/**
+ * DM the contributor when a payout lands (DAO push): money just arrives, and an
+ * unannounced transfer looks like nothing happened. Within the reconciler the
+ * paid transition itself is exactly-once (the locked CAS — racing reconcilers
+ * can't both flip a row to 'paid'), so the per-payout dedup key here guards the
+ * OTHER callers: anything invoking this directly (ops tooling, the demo's
+ * second-observation pin) can never double-DM.
+ */
+export async function notifyPayoutPaid(
+  userId: number,
+  taskId: number,
+  payoutId: number,
+  account: string | null,
+): Promise<void> {
+  // Erasure-guarded (enqueueAboutContributor): reconcilers fire this detached
+  // from any erasure, and a /forget between the chain read and this enqueue would
+  // otherwise leave a PII row the purge already swept past.
+  await enqueueAboutContributor(userId, async (_c, L) => {
+    await enqueue({
+      dedupKey: `payout-paid:${payoutId}`,
+      chatId: String(userId),
+      subjectId: userId, // names the recipient's payout account
+      // The wrapper's locale, not a contributorLocale() re-read: this runs
+      // inside the reconciler's locked CAS, and the contributor row was just
+      // read FOR UPDATE two lines up — the "no second read" contract.
+      text: clampMessage(t(L, 'notify.payoutPaid', { taskId, account })),
+    });
+  });
+}
+
+/**
+ * Ops alert: the delivery worker exhausted a notification's retry budget on a
+ * TRANSIENT error — a systemic delivery problem, unlike the routine permanent
+ * 403s (blocked bot, dead chat) the worker excludes before calling this. Fans
+ * to global admins through the same outbox; the 'ops-alert:' dedup prefix is
+ * the loop guard — the worker never alerts about an alert row (see processDue).
+ * `alsoCount` is how many earlier give-ups this alert summarizes (the worker
+ * throttles to one alert per window, not one per failure).
+ */
+export async function notifyOpsGiveUp(notificationId: number, attempts: number, error: string, alsoCount: number): Promise<void> {
+  await enqueueForAdmins(null, (adminId, L) => [
+    {
+      dedupKey: `ops-alert:giveup:${notificationId}:${adminId}`,
+      text: clampMessage(t(L, 'notify.opsGiveUp', { notificationId, attempts, error, alsoCount })),
+    },
+  ]);
 }
 
 /**

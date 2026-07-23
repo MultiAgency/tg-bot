@@ -18,7 +18,6 @@ import {
   assignApplication,
   submitWork,
   reviewSubmission,
-  upsertWalletLink,
 } from '../src/core/service.js';
 
 const PORT = 8787;
@@ -61,12 +60,6 @@ async function main(): Promise<void> {
   await assignApplication(app.id, ADMIN);
   const { submission } = await submitWork(app.id, ADA, 'link', 'https://github.com/multi/bot/pull/7');
   await reviewSubmission(submission.id, ADMIN, 'approve', null);
-
-  // Ada linked a NEAR wallet, so the Payouts screen shows the linked state.
-  // Set PREVIEW_LINKED=0 to preview the un-linked (connect + disclosure) state.
-  if (process.env.PREVIEW_LINKED !== '0') {
-    await upsertWalletLink(ADA, 'webfoundry.testnet', 'ed25519:11111111111111111111111111111111', 'testnet');
-  }
 
   serve({ fetch: createWebApp().fetch, port: PORT }, () => {
     const initData = signInitData(

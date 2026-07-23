@@ -14,7 +14,7 @@ import { t } from './i18n.js';
 
 /** Bare Apply button (callback form; `apply:<id>` starts the pitch wizard) —
  *  the ONE encoding of that callback contract, composable into ad-hoc rows. */
-export const applyBtn = (task: Task, locale: string) =>
+const applyBtn = (task: Task, locale: string) =>
   Markup.button.callback(t(locale, 'btn.apply', { id: task.id }), `apply:${task.id}`);
 
 /**
@@ -24,7 +24,7 @@ export const applyBtn = (task: Task, locale: string) =>
  * inline-shared cards, since none deliver the free-form replies the wizard
  * collects. Needs the bot's @username.
  */
-export const applyDeepLinkBtn = (task: Task, botUsername: string, locale: string) =>
+const applyDeepLinkBtn = (task: Task, botUsername: string, locale: string) =>
   Markup.button.url(t(locale, 'btn.apply', { id: task.id }), `https://t.me/${botUsername}?start=t${task.id}`);
 
 export const deepLinkApplyButton = (task: Task, botUsername: string, locale: string) =>
@@ -40,9 +40,12 @@ export const deepLinkApplyButton = (task: Task, botUsername: string, locale: str
 export const applyAffordanceBtn = (task: Task, isPrivate: boolean, botUsername: string, locale: string) =>
   isPrivate ? applyBtn(task, locale) : botUsername ? applyDeepLinkBtn(task, botUsername, locale) : null;
 
-export const approveButton = (task: Task, locale: string) =>
+/** The draft decision pair: publish it, or delete it (a draft may distill
+ *  unreleased group chatter — rejecting must not force an announcement). */
+export const draftButtons = (task: Task, locale: string) =>
   Markup.inlineKeyboard([
     Markup.button.callback(t(locale, 'btn.approveOpen', { id: task.id }), `approve:${task.id}`),
+    Markup.button.callback(t(locale, 'btn.discard', { id: task.id }), `discard:${task.id}`),
   ]);
 
 /** Bare assign / decline row for one applicant (keyed by application id) —

@@ -2,10 +2,10 @@ import { useState } from 'react';
 import { initData } from './telegram';
 import { Board } from './screens/Board';
 import { MyWork } from './screens/MyWork';
-import { Claim } from './screens/Claim';
+import { Payouts } from './screens/Payouts';
 import { TaskDetail } from './screens/TaskDetail';
 
-type Tab = 'board' | 'mine' | 'claim';
+type Tab = 'board' | 'mine' | 'payouts';
 export type View = { tab: Tab } | { tab: Tab; taskId: number };
 
 export function App() {
@@ -41,7 +41,7 @@ export function App() {
       ) : view.tab === 'mine' ? (
         <MyWork onOpen={openTask} />
       ) : (
-        <Claim />
+        <Payouts />
       )}
 
       <nav className="tabs">
@@ -51,7 +51,7 @@ export function App() {
         <button className={view.tab === 'mine' && !('taskId' in view) ? 'active' : ''} onClick={() => goTab('mine')}>
           My work
         </button>
-        <button className={view.tab === 'claim' && !('taskId' in view) ? 'active' : ''} onClick={() => goTab('claim')}>
+        <button className={view.tab === 'payouts' && !('taskId' in view) ? 'active' : ''} onClick={() => goTab('payouts')}>
           Payouts
         </button>
       </nav>

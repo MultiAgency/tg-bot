@@ -17,9 +17,12 @@ interface Call {
   extra?: Record<string, unknown>;
 }
 
-/** A fake Sender that records calls and can fail (permanently) or flood (transient 429). */
-function makeSender(opts: { failChats?: number[]; floodTimes?: Record<number, number> } = {}): Sender & { calls: Call[] } {
+/** A fake Sender that records calls and can fail (transiently or permanently) or flood (429). */
+function makeSender(
+  opts: { failChats?: number[]; blockedChats?: number[]; floodTimes?: Record<number, number> } = {},
+): Sender & { calls: Call[] } {
   const failChats = new Set(opts.failChats ?? []);
+  const blockedChats = new Set(opts.blockedChats ?? []);
   const flood = new Map<number, number>(Object.entries(opts.floodTimes ?? {}).map(([k, v]) => [Number(k), v]));
   const calls: Call[] = [];
   const maybeThrow = (chatId: number | string): void => {
@@ -28,6 +31,12 @@ function makeSender(opts: { failChats?: number[]; floodTimes?: Record<number, nu
     if (left > 0) {
       flood.set(n, left - 1);
       throw Object.assign(new Error('Too Many Requests'), { parameters: { retry_after: 0.01 } });
+    }
+    // The 403 shape Telegram returns when the recipient blocked the bot.
+    if (blockedChats.has(n)) {
+      throw Object.assign(new Error('Forbidden: bot was blocked by the user'), {
+        response: { error_code: 403, description: 'Forbidden: bot was blocked by the user' },
+      });
     }
     if (failChats.has(n)) throw new Error(`chat ${n} unreachable`);
   };
@@ -90,6 +99,17 @@ async function main(): Promise<void> {
   assert.ok(failed.last_error, 'records the last error');
   assert.ok(failing.calls.length >= 6, 'retried each attempt');
   assert.equal((await statusCounts()).failed, 1, 'one failed, observable in counts');
+
+  // --- 4b. Permanent errors fail FAST — no retry budget burned on a 403 ---
+  // "Blocked by the user" can never succeed on retry; at fan-out scale, five
+  // futile paced attempts per blocked recipient delay live rows behind dead ones.
+  await enqueue({ dedupKey: 'q:blocked', chatId: '550', subjectId: null, text: 'dm to a blocker' });
+  const blocking = makeSender({ blockedChats: [550] });
+  await drainNotifications(blocking);
+  const blockedRow = (await findByDedup('q:blocked'))!;
+  assert.equal(blockedRow.status, 'failed', '403 marks the row failed');
+  assert.equal(blockedRow.attempts, 1, 'exactly one attempt — permanent errors skip the backoff budget');
+  assert.match(blockedRow.last_error ?? '', /blocked/, 'records why');
 
   // --- 5. 429 flood-control: waited out, then delivered — and NOT counted against the budget ---
   await enqueue({ dedupKey: 'q:flood', chatId: '600', subjectId: null, text: 'later' });

@@ -112,10 +112,18 @@ async function main(): Promise<void> {
   const contribInRoom = await executeAgentTool(makeEnv(80, false, ROOM).env, 'get_task', { taskId: roomDraft.id });
   assert.ok(errText(contribInRoom).includes('not visible'), 'draft hidden from a non-manager in its room');
   const mgrInRoom = await executeAgentTool(makeEnv(ADMIN, true, ROOM).env, 'get_task', { taskId: roomDraft.id });
-  assert.ok(!('error' in mgrInRoom), 'draft visible to a manager of its room');
+  assert.ok(!('error' in mgrInRoom), 'its own room’s manager may learn the draft exists');
+  // …but the BODY never leaves the tool: whatever it returns, the model may
+  // speak into the group — draft review stays in the /approve DM flow.
+  const draftView = mgrInRoom.task as Record<string, unknown>;
+  assert.equal(draftView.status, 'draft', 'the manager sees id + status');
+  assert.ok(
+    !('title' in draftView) && !('description' in draftView) && !('requiredOutput' in draftView),
+    'draft title/body are never returned through the agent',
+  );
   const mgrOtherRoom = await executeAgentTool(makeEnv(ADMIN, true, -100999).env, 'get_task', { taskId: roomDraft.id });
   assert.ok(errText(mgrOtherRoom).includes('not visible'), 'draft hidden from a manager viewing a different room');
-  ok('open public; draft only to its own room’s manager');
+  ok('open public; draft existence manager-only; draft content never surfaces');
 
   step('create_task_draft: admin-gated, NaN slots safe');
   r = await executeAgentTool(makeEnv(70, false).env, 'create_task_draft', { title: 'X', description: 'y' });

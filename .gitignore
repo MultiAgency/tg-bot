@@ -3,7 +3,8 @@ dist/
 target/
 *.log
 .env
-.env.local
+.env.*
+!.env.example
 data/
 *.sqlite
 *.sqlite-journal

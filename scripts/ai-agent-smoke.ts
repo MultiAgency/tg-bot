@@ -71,6 +71,13 @@ async function main(): Promise<void> {
 
   const after = (await listDraftTasks()).length;
   console.log(`\nDraft tasks created by the agent this run: ${after - before} (expect ≥1, all Draft — never Open).`);
+  if (after - before < 1) {
+    // Hard-fail, not a printed shrug: this smoke exists to catch live-model
+    // drift, and "the agent re-asks instead of drafting once it has the three
+    // essentials" is exactly the drift it once let pass silently (2026-07-14).
+    console.error('❌ the agent created no draft from a fully-specified request — prompt drift.');
+    process.exit(1);
+  }
 }
 
 runScript(main);

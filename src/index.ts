@@ -2,10 +2,12 @@ import { createBot, CONTRIBUTOR_COMMANDS, ADMIN_COMMANDS, GROUP_COMMANDS } from 
 import { config } from './config.js';
 import { aiEnabled } from './ai/assist.js';
 import { initSchema, closePool } from './core/db.js';
-import { reclaimStaleSignals } from './core/service.js';
-import { startWorker, stopWorker } from './bot/worker.js';
+import { reclaimStaleSignals, setPayoutPaidNotifier } from './core/service.js';
+import { startWorker, stopWorker, setGiveUpAlerter, setStaleNudger } from './bot/worker.js';
+import { setAnnounceChatNumericId, notifyPayoutPaid, notifyOpsGiveUp, nudgeStaleAssignments } from './bot/notify.js';
 import { drainDetached, beginShutdown } from './bot/background.js';
-import { startWebServer, stopWebServer } from './web/server.js';
+import { startWebServer, stopWebServer, setPollerStatus } from './web/server.js';
+import { TelegramError } from 'telegraf';
 
 async function main(): Promise<void> {
   // Apply pending migrations before anything touches the database.
@@ -16,6 +18,19 @@ async function main(): Promise<void> {
   // this only catches unclean deaths. Single writer: nothing else is running.
   const reclaimed = await reclaimStaleSignals();
   if (reclaimed > 0) console.log(`[signals] reclaimed ${reclaimed} orphaned evaluation(s) from a prior run`);
+
+  // The reconciler DMs a contributor when their payout lands (dedup-keyed, via
+  // the notification queue) — registered here so core/ never imports bot/.
+  setPayoutPaidNotifier(notifyPayoutPaid);
+
+  // Minimal delivery alerting: retry-exhausted transient send failures fan a
+  // throttled summary to global admins — registered here (same pattern as
+  // above) so worker.ts never imports notify.ts, which imports it.
+  setGiveUpAlerter(notifyOpsGiveUp);
+
+  // Pre-stale assignment nudges (a fair warning before /unassign territory) —
+  // swept from the worker's leader tick; injected here, same seam as above.
+  setStaleNudger(nudgeStaleAssignments);
 
   const bot = createBot();
 
@@ -38,6 +53,19 @@ async function main(): Promise<void> {
     ),
   ]);
 
+  // ANNOUNCE_CHAT_ID accepts an @username, but the room-vs-channel announce
+  // dedup compares numeric room ids — resolve it once so a room that IS the
+  // announce chat doesn't get every approval posted twice. Best-effort: on
+  // failure the dedup falls back to raw-string comparison (as before).
+  if (config.announceChatId.startsWith('@')) {
+    try {
+      const chat = await bot.telegram.getChat(config.announceChatId);
+      setAnnounceChatNumericId(chat.id);
+    } catch (err) {
+      console.warn('[startup] could not resolve ANNOUNCE_CHAT_ID username:', err instanceof Error ? err.message : err);
+    }
+  }
+
   // Point the chat menu button (next to the input field) at the Mini App, when
   // its public origin is configured. Non-fatal like the command menus.
   if (config.webAppUrl) {
@@ -46,13 +74,65 @@ async function main(): Promise<void> {
       .catch(menuFail('web_app menu button'));
   }
 
-  // launch() resolves only once the bot stops, so start it without awaiting.
-  const launched = bot.launch().catch((err) => {
-    console.error('Bot stopped with error:', err);
-    process.exit(1);
-  });
+  // launch() resolves only once the bot stops (graceful) and rejects on a fatal
+  // poll error. A 409 Conflict is NOT fatal: during a deploy rollover the old
+  // container can keep long-polling the token for up to ~50s before Telegram
+  // releases it. The old behaviour (process.exit on any launch error) turned that
+  // transient overlap into a crash-loop that never cut over — the dying container
+  // never held the token long enough to displace the old poller. Instead, keep
+  // the process (and the web server below, so the platform sees a live instance)
+  // up and retry launch with backoff until the other poller drops. Telegraf news
+  // up a fresh Polling per launch(), so re-calling is safe. 401 (bad token) and
+  // every other error stay fatal. A graceful stop() resolves launch() (no throw);
+  // the backoff is cancelable so shutdown never waits it out.
+  let shuttingDown = false;
+  let wakeFromBackoff: (() => void) | null = null;
+  // /healthz's poller field: the web tier can be green while this loop is
+  // wedged in 409 backoff, silently receiving no updates — the one liveness
+  // gap README concedes the bot can't self-report. Now it can, to whatever
+  // external check watches /healthz.
+  let pollerBackoff = false;
+  setPollerStatus(() => (pollerBackoff ? 'backoff' : 'up'));
+  const launchWithRetry = async (): Promise<void> => {
+    for (let attempt = 0; !shuttingDown; attempt++) {
+      // A relaunch only counts as recovered once it survives its first
+      // getUpdates round-trip (a 409 surfaces within seconds) — resetting
+      // eagerly would flash 'up' at a /healthz monitor mid-backoff.
+      const recovered = setTimeout(() => {
+        pollerBackoff = false;
+      }, 10_000);
+      try {
+        await bot.launch();
+        return; // resolved => stop() was called (graceful shutdown)
+      } catch (err) {
+        clearTimeout(recovered);
+        if (shuttingDown) return; // shutting down; let shutdown() finish the exit
+        if (!(err instanceof TelegramError && err.code === 409)) {
+          console.error('Bot stopped with error:', err);
+          process.exit(1);
+        }
+        pollerBackoff = true;
+        const delayMs = Math.min(60_000, 5_000 * 2 ** Math.min(attempt, 4));
+        console.warn(
+          `[launch] 409 Conflict — another getUpdates poller still holds the token ` +
+            `(deploy rollover?); retrying in ${delayMs / 1000}s`,
+        );
+        await new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, delayMs);
+          wakeFromBackoff = () => {
+            clearTimeout(t);
+            resolve();
+          };
+        });
+        wakeFromBackoff = null;
+      }
+    }
+  };
+  const launched = launchWithRetry();
 
   const shutdown = async (signal: string): Promise<void> => {
+    shuttingDown = true;
+    wakeFromBackoff?.(); // interrupt a pending relaunch backoff so shutdown isn't held
     // Abort cancelable in-flight work up front — the detached signal/review AI
     // calls AND a /newtask wizard's in-flight /ai draft — so neither pins the
     // update-handler drain (`await launched`) nor the detached drain for the

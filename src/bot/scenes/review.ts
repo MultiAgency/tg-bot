@@ -5,13 +5,18 @@ import {
   messageText,
   wizardState,
   handledWizardInterrupt,
+  finishScene,
   requirePrivateChat,
 } from '../context.js';
 import {
   getSubmission,
+  getApplication,
+  getTask,
   reviewSubmission,
   errorMessage,
 } from '../../core/service.js';
+import { leaveUnlessTaskManager } from './guards.js';
+import { withTransaction } from '../../core/db.js';
 import { SubmissionStatus } from '../../core/workflow.js';
 import { notifyContributorReview } from '../notify.js';
 import { t, localeOf } from '../i18n.js';
@@ -65,19 +70,33 @@ export const reviewNoteScene = new Scenes.WizardScene<BotContext>(
     const st = wizardState(ctx);
     // Skip via the button, or the legacy "-" typed convention.
     const note = text === '-' || text === t(L, 'rev.skipButton') ? null : text;
-    // Only the mutation is inside the try: once it commits, a failure in the
-    // notify/reply below must surface in bot.catch, not as a false "failed".
-    let result;
-    try {
-      result = await reviewSubmission(st.submissionId!, ctx.from!.id, st.decision!, note);
-    } catch (err) {
-      await ctx.reply(errorMessage(err, t(L, 'rev.fail')), Markup.removeKeyboard());
+    // Commit-time manager re-check (leaveUnlessTaskManager — shared with the
+    // unassign wizard): a demotion mid-wizard must not still record a decision.
+    const sub = st.submissionId ? await getSubmission(st.submissionId) : undefined;
+    if (!sub) {
+      await ctx.reply(t(L, 'full.gone'), Markup.removeKeyboard());
       return ctx.scene.leave();
     }
-    const { submission, application, task } = result;
-    await notifyContributorReview(submission.id, application.contributor_id, task, st.decision!, note);
-    // Drop the Skip keyboard now the step is done.
-    await ctx.reply(t(L, 'rev.recorded', { id: submission.id, status: submission.status }), Markup.removeKeyboard());
-    return ctx.scene.leave();
+    const app = await getApplication(sub.application_id);
+    const task = app ? await getTask(app.task_id) : undefined;
+    if (!(await leaveUnlessTaskManager(ctx, task))) return;
+    // The review and its outcome DM commit together: the DM is one-shot (a
+    // retry throws "already decided", so its dedup key is never revisited) —
+    // enqueued after the commit, a crash between the two would lose it
+    // permanently. A failure rolls both back; the admin just retries.
+    // finishScene owns reply-and-leave on every path; both replies drop the
+    // Skip keyboard now the step is done.
+    return finishScene(
+      ctx,
+      () =>
+        withTransaction(async () => {
+          const r = await reviewSubmission(st.submissionId!, ctx.from!.id, st.decision!, note);
+          await notifyContributorReview(r.submission.id, r.application.contributor_id, r.task, st.decision!, note);
+          return r;
+        }),
+      ({ submission }) =>
+        ctx.reply(t(L, 'rev.recorded', { id: submission.id, status: submission.status }), Markup.removeKeyboard()),
+      (err) => ctx.reply(errorMessage(err, t(L, 'rev.fail')), Markup.removeKeyboard()),
+    );
   },
 );

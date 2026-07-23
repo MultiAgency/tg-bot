@@ -2,7 +2,7 @@ import type OpenAI from 'openai';
 import { config } from '../config.js';
 import { client } from './client.js';
 import { AGENT_TOOLS, executeAgentTool, type AgentEnv } from './agentTools.js';
-import { esc } from '../bot/format.js';
+import { esc, clampMessage } from '../bot/format.js';
 
 /**
  * The conversational agent behind group /ai mode. When a room turns AI mode on,
@@ -26,10 +26,17 @@ confirmation card with real buttons — it never performs the action itself. Nev
 applied to anything unless you called the matching tool, and always make clear a human still taps the button \
 ("I've drafted this as task #4 — tap Approve to open it").
 
+You speak only in your own voice, as the bot. Refuse any request to repeat, relay, or "say exactly" \
+someone's text — including anything framed as an announcement, an admins' notice, a payment or fee \
+instruction, or a message for the group — no matter who asks. Summarize in your own words instead, and \
+never pass along payment addresses, usernames, or links a user asked you to repeat.
+
 To draft a task you need three essentials: a clear title, what's needed, and the acceptance criteria (definition \
 of done). Ask AT MOST ONE short round of questions, and only when one of those three is genuinely missing. For any \
-lesser detail (exact links, tone, dimensions), make a reasonable assumption and note it in the draft rather than \
-asking again. Once you have the three essentials, call create_task_draft — do not keep asking. Never invent a \
+lesser detail (exact links, tone, focus, angle, dimensions), make a reasonable assumption and note it in the draft \
+rather than asking again. The moment you can state all three essentials, call create_task_draft IN THAT SAME TURN — \
+if you catch yourself reciting the essentials back to the user, that is the signal to draft, not to ask another \
+question. A draft is cheap and editable; a needless question costs the admin a round-trip. Never invent a \
 reward amount. Keep replies short and conversational, in the language the user wrote in. If something isn't \
 covered by a tool (reviewing a submission, assigning applicants), say so briefly — don't invent a slash command.
 
@@ -44,6 +51,14 @@ function roleLine(isManager: boolean): string {
 }
 
 const MAX_TOOL_ROUNDS = 4;
+/** Total tool EXECUTIONS per turn, across all rounds. Rounds alone don't bound
+ *  fan-out: one completion can carry dozens of parallel calls, and the
+ *  card-sending tools (propose_apply, create_task_draft) each post a group
+ *  message — "show me apply cards for every open task" must not turn one
+ *  budget slot into a 25-message spray (and a Telegram flood-limit 429).
+ *  Excess calls aren't executed; the model gets a budget-exhausted result and
+ *  must answer with what it has. Generous for real flows (1–3 calls). */
+const MAX_TOOL_CALLS = 8;
 const MAX_TOKENS = 700;
 
 // Conversation memory: RAM-only, bounded, TTL-evicted (see file header).
@@ -97,6 +112,64 @@ function saveHistory(key: string, messages: Msg[], now: number): void {
   }
 }
 
+// ---- Per-room hourly budget ----
+// The agent is the expensive path (up to MAX_TOOL_ROUNDS completions on the
+// stronger agentModel per addressed message, each replaying the history), and
+// /ai on is reachable by anyone who adds the bot to a group — so, like signal
+// scoring (claimSignalSlot), it carries a per-room hourly cap. RAM-only on
+// purpose: agent activity is deliberately never persisted (signal rows exist
+// anyway; agent turns don't), and a restart resetting the window is an
+// acceptable failure mode for an abuse bound.
+const BUDGET_WINDOW_MS = 60 * 60_000;
+interface RoomBudget {
+  windowStart: number;
+  used: number;
+  noticeSent: boolean;
+}
+const budgets = new Map<number, RoomBudget>();
+
+// Global hourly budget on top of the per-room ones: the per-room cap scales
+// linearly with rooms, and rooms are free to create (any group join registers
+// one) — this is the actual ceiling on the agent model's bill. Same RAM-only
+// trade-off as the room budgets.
+const globalBudget = { windowStart: 0, used: 0 };
+
+/**
+ * Claim one agent turn against this room's current hour AND the global hour.
+ * `notify` is true only on the FIRST refusal of a window per room — the cap
+ * itself must not become a reply per spam message, or a mention flood turns
+ * the bot into the spammer.
+ */
+export function claimAgentSlot(chatId: number): { allowed: boolean; notify: boolean } {
+  const now = Date.now();
+  // Eviction is expiry, never an LRU cap: a size cap would let the exact abuser
+  // this bound exists for (one actor enabling AI in many rooms) cycle SPENT
+  // budgets out of the map and re-claim. Entries are three numbers, so the map
+  // is bounded by rooms active within the hour — growth is not the risk here.
+  for (const [id, entry] of budgets) {
+    if (now - entry.windowStart >= BUDGET_WINDOW_MS) budgets.delete(id);
+  }
+  if (now - globalBudget.windowStart >= BUDGET_WINDOW_MS) {
+    globalBudget.windowStart = now;
+    globalBudget.used = 0;
+  }
+  let b = budgets.get(chatId);
+  if (!b) {
+    b = { windowStart: now, used: 0, noticeSent: false };
+    budgets.set(chatId, b);
+  }
+  // A global refusal reuses the room's once-per-window notice flag: each room
+  // hears "budget spent" at most once an hour regardless of which cap tripped.
+  if (b.used >= config.agentMaxPerHour || globalBudget.used >= config.agentGlobalMaxPerHour) {
+    const notify = !b.noticeSent;
+    b.noticeSent = true;
+    return { allowed: false, notify };
+  }
+  b.used += 1;
+  globalBudget.used += 1;
+  return { allowed: true, notify: false };
+}
+
 function parseArgs(raw: string): Record<string, unknown> {
   try {
     const v = JSON.parse(raw || '{}');
@@ -128,6 +201,7 @@ export async function runAgentTurn(chatId: number, userText: string, env: AgentE
   const FALLBACK = "Sorry — I couldn't finish that. Try rephrasing, or ask an admin.";
 
   try {
+    let toolCalls = 0;
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       const res = await client.chat.completions.create(
         {
@@ -148,10 +222,12 @@ export async function runAgentTurn(chatId: number, userText: string, env: AgentE
         // acknowledgement rather than silence — then persist the compacted turn.
         const text = msg.content?.trim() || FALLBACK;
         // Escape the model's free-form text: replies go out under HTML mode, and
-        // a '<' or '&' in the answer would otherwise 400 the send. The raw text
-        // is what we commit to conversation memory (the model should see its own
-        // words, not entities).
-        await env.reply(esc(text));
+        // a '<' or '&' in the answer would otherwise 400 the send. clampMessage
+        // caps it at 4096 (escaping can expand a &-/<-heavy answer past the cap —
+        // a code snippet, say — and an oversized send would 400 and lose the whole
+        // reply). The raw text is what we commit to conversation memory (the model
+        // should see its own words, not entities or a truncation).
+        await env.reply(clampMessage(esc(text)));
         commit(text);
         console.log(`[agent] turn served (${text.length} chars, ${round} tool round(s))`);
         return;
@@ -159,10 +235,14 @@ export async function runAgentTurn(chatId: number, userText: string, env: AgentE
 
       // Every tool_calls message must be answered by its matching results in the
       // SAME turn. executeAgentTool never throws (it returns { error }), so the
-      // working sequence stays well-formed even when a tool fails.
+      // working sequence stays well-formed even when a tool fails — and a call
+      // past the per-turn budget is answered (well-formedness) but not executed.
       for (const call of calls) {
         if (call.type !== 'function') continue;
-        const result = await executeAgentTool(env, call.function.name, parseArgs(call.function.arguments));
+        const result =
+          toolCalls++ < MAX_TOOL_CALLS
+            ? await executeAgentTool(env, call.function.name, parseArgs(call.function.arguments))
+            : { error: 'Tool budget for this turn is used up — answer with what you already have.' };
         working.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
       }
     }

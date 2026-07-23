@@ -3,13 +3,14 @@
 // when opened outside Telegram (a plain browser during dev): no bridge → no
 // initData → the app shows an "open in Telegram" state instead of crashing.
 
+// Only the bridge surface this app actually calls — extend it when a new
+// capability gets a consumer, not before.
 interface TelegramWebApp {
   initData: string;
   ready: () => void;
   expand: () => void;
   openTelegramLink: (url: string) => void;
-  colorScheme?: 'light' | 'dark';
-  HapticFeedback?: { impactOccurred: (style: 'light' | 'medium' | 'heavy') => void; selectionChanged: () => void };
+  HapticFeedback?: { selectionChanged: () => void };
 }
 
 declare global {
@@ -18,15 +19,15 @@ declare global {
   }
 }
 
-export const webApp: TelegramWebApp | undefined = window.Telegram?.WebApp;
+const webApp: TelegramWebApp | undefined = window.Telegram?.WebApp;
 
 /**
  * The signed initData used to authenticate every API call. Inside Telegram it
  * comes from the bridge. A `?initData=…` query param is accepted as a fallback
  * ONLY on localhost (the local preview) — NOT a bypass: the server still
  * validates the signature against the bot token, so only a legitimately-signed
- * payload works. Gating it to localhost keeps a signed payload (a 24h credential)
- * out of any PRODUCTION URL — and therefore out of access logs and browser
+ * payload works. Gating it to localhost keeps a signed payload (a time-limited
+ * credential — see auth.ts's maxAgeSec) out of any PRODUCTION URL — and therefore out of access logs and browser
  * history — where initData always arrives via the bridge, never the query string.
  */
 const isLocalPreview = ['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname);

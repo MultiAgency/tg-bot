@@ -18,7 +18,9 @@ npm run queue-demo        # the notification delivery queue (retries, rate limit
 npm run edge-demo         # adversarial edges: Telegram limits, groups, races, migrations
 npm run rooms-demo        # rooms, room admins, signal detection + AI mode (AI endpoint stubbed)
 npm run agent-tools-demo  # the conversational agent's tool guards (visibility, apply mirror)
-npm run web-smoke         # Mini App tier: initData auth, oRPC reads, payouts, wallet link
+npm run web-smoke         # Mini App tier: initData auth, oRPC reads, payouts, payout account
+npm run dao-check         # DAO proposal-status mapping (pure, no network/DB)
+npm run dao-demo          # DAO-push settlement walk: propose → adopt → vote → settle (RPC stubbed)
 npm run dev               # tsx watch (needs a real BOT_TOKEN in .env)
 npm run db:init           # create + migrate the local docker-compose Postgres
 npm run db:reset          # drop + recreate the local dev database
@@ -28,17 +30,37 @@ npm run db:reset          # drop + recreate the local dev database
 drives the real middleware, scenes, and buttons against a throwaway database;
 `core-demo` and `queue-demo` cover the service layer and delivery queue;
 `edge-demo`'s transport stub rejects over-limit messages like the live API;
-and `rooms-demo` stubs the NEAR AI endpoint at `globalThis.fetch` (the real
-OpenAI SDK client still runs) to drive signal detection deterministically.
+`rooms-demo` stubs the NEAR AI endpoint at `globalThis.fetch` (the real
+OpenAI SDK client still runs) to drive signal detection deterministically;
+and `dao-demo` stubs the NEAR JSON-RPC to walk the push-payout settlement path.
+
+Three **live, out-of-gate** DAO scripts (real testnet DAO + env, run by hand via
+`npx tsx`, never in `npm test`): `scripts/dao-live.ts` (read-only — prints policy
++ recent proposals), `scripts/dao-propose-live.ts` (real `proposePayout` through
+the OutLayer TEE), and `scripts/dao-settle-live.ts` (headless reconcile of the
+existing `proposed` queue — advance/settle a live payout after a council vote).
+
+**Deploy checklist** (prod = Railway, `railway up` with the working tree):
+1. `npm test` green.
+2. `npm run ai-agent-smoke` — LIVE-model drift check (real NEAR AI key; outside
+   the gate because it costs tokens). It hard-fails if the agent stops drafting
+   from a fully-specified request.
+3. `railway up --detach`; verify `/healthz`, `GET /config` (settlement flags as
+   intended), `getWebhookInfo` (pending≈0), and the boot log.
+4. Commands sent to the bot during the rollout window may be lost
+   (`overlapSeconds: 0` minimizes it) — re-send anything important.
 
 ## Architecture rules
 
 - **`src/core/` must not import from Telegraf or `src/bot/`.** It is the
   framework-free service layer both surfaces share — the bot and the Mini App
   tier (`src/web/`) call core, never the reverse.
-- **The web tier is read-only.** Every mutation (apply, submit, review) stays in
-  the bot; `src/web/api.ts` procedures only read, scoped to the initData-verified
-  caller. Don't add web mutations without treating it as an auth-model change.
+- **The web tier is read-mostly.** Every task-workflow mutation (apply, submit,
+  review) stays in the bot; the `src/web/api.ts` oRPC procedures only read,
+  scoped to the initData-verified caller. The sole write endpoint is the
+  caller's own payout account — `POST /api/payout-account` (typed NEAR account,
+  DAO rail) — self-scoped and existence-checked on-chain. Adding any OTHER web
+  mutation is an auth-model change; treat it as one.
 - **Task visibility floor**: a Draft is never public — it may distill private
   group chatter no human approved for release. Any new surface that resolves a
   task by id must read through `isTaskPublic`/`getPublicTask` (service.ts) and
@@ -78,13 +100,18 @@ OpenAI SDK client still runs) to drive signal detection deterministically.
   update of the old one. The only deletion path is `/forget` (right-to-erasure),
   which must also scrub history *details* (pitches, "contributor N" mentions),
   not just actor links — see `eraseActor` in `src/core/models/history.ts`.
-  Erasure yields to money exactly once: `forgetContributor` refuses while a
-  funded escrow payout exists — cascading its ledger row away would strand NEAR
-  already deposited on-chain. The guard reads the CHAIN, not just the ledger
-  status: it calls `get_allocation` for every still-owed payout of a linked
-  wallet and refuses if any is funded (failing closed on an RPC error), catching
-  a payout funded on-chain but still `pending` in the DB. Keep that guard ahead
-  of any new cascade.
+  Erasure yields to money: `forgetContributor` refuses while money is in flight —
+  an open DAO `Transfer` proposal (status `proposed` with a live on-chain
+  proposal the council can still approve). Cascading such a ledger row away would
+  strand NEAR the council can still send. The guard reads the CHAIN, not just the
+  ledger: the preflight reconciles each `proposed` row via
+  `reconcilePayout`, fails CLOSED on an unreadable chain, and has a
+  config-independent in-transaction backstop (`countByContributorStatus` on
+  `proposed`) so a missing `DAO_CONTRACT_ID` can't open a gap. An abandoned
+  claim (`proposed` with no on-chain `proposal_id`) holds erasure only until
+  reconcile's grace window auto-heals it to `pending` — erasure is delayed, never
+  lost, and never races a proposal that may still be mid-flight. Keep this guard
+  ahead of any new cascade.
   Notification rows keep their rendered text after delivery, so `subjectId` is
   a **required** field on enqueue: name the contributor whose personal data the
   content carries, or pass `null` only for task-only content. That field is
@@ -117,7 +144,10 @@ OpenAI SDK client still runs) to drive signal detection deterministically.
   (including local dev against the deployed token).
 - Signal detection only sees group texts if the bot is an admin of that group
   or global privacy mode is off — under the default privacy mode the listener
-  simply never fires (no error, no log).
+  simply never fires (no error, no log). The enable paths (`/enablesignals`,
+  `/ai on`, the `/settings` taps) detect this (`can_read_all_group_messages` +
+  a `getChatMember` self-check) and append a warning with the fix; keep that
+  wired when touching the toggles.
 - The DB layer (`src/core/db.ts`) runs on a `pg` Pool at READ COMMITTED, so a
   check-then-write is NOT atomic by default the way it was under synchronous
   better-sqlite3. A service mutator wraps its work in `withTransaction()`
