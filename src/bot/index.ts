@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Telegraf, session, Scenes, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { config, isAdmin } from '../config.js';
@@ -115,6 +116,7 @@ import {
 } from './notify.js';
 import { handleGroupMessage } from './signals.js';
 import { getLastProposalId, parseNearToYocto } from '../near/dao.js';
+import { isValidAccountId } from '../near/account.js';
 import { runAgentTurn, claimAgentSlot } from '../ai/agent.js';
 import type { AgentEnv } from '../ai/agentTools.js';
 import { runDetached } from './background.js';
@@ -159,6 +161,38 @@ async function requireAdminCmd(ctx: BotContext): Promise<boolean> {
  *  and vote, never a voting affordance of its own. */
 function proposalUrl(id: number | null): string | null {
   return id != null && config.daoProposalUrl !== '' ? config.daoProposalUrl.replaceAll('{id}', String(id)) : null;
+}
+
+const PAY_CONFIRM_TTL_MS = 5 * 60_000;
+
+interface PendingPayConfirmation {
+  adminId: number;
+  payoutId: number;
+  taskId: number;
+  amount: string;
+  account: string;
+  yocto: string;
+  reward: string;
+  expiresAt: number;
+}
+
+const pendingPayConfirmations = new Map<string, PendingPayConfirmation>();
+
+function createPayConfirmation(input: Omit<PendingPayConfirmation, 'expiresAt'>): string {
+  const now = Date.now();
+  for (const [token, pending] of pendingPayConfirmations) {
+    if (pending.expiresAt <= now) pendingPayConfirmations.delete(token);
+  }
+  const token = randomUUID();
+  pendingPayConfirmations.set(token, { ...input, expiresAt: now + PAY_CONFIRM_TTL_MS });
+  return token;
+}
+
+function takePayConfirmation(token: string, adminId: number | undefined): PendingPayConfirmation | null {
+  const pending = pendingPayConfirmations.get(token);
+  pendingPayConfirmations.delete(token);
+  if (!pending || pending.expiresAt <= Date.now() || pending.adminId !== adminId) return null;
+  return pending;
 }
 
 /** The single pending payout `taskId` names, or null after replying why not
@@ -1399,20 +1433,46 @@ export function createBot(): Telegraf<BotContext> {
     if (!payout) return;
     const account = accountArg || (await getPayoutAccount(payout.contributor_id));
     if (!account) return ctx.reply(t(L, 'pay.noRecipient', { taskId, amount: amountArg }));
+    if (!isValidAccountId(account)) return ctx.reply(t(L, 'pay.badRecipient'));
+    const token = createPayConfirmation({
+      adminId: ctx.from!.id,
+      payoutId: payout.id,
+      taskId,
+      amount: amountArg,
+      account,
+      yocto,
+      reward: payout.reward,
+    });
+    return ctx.reply(
+      t(L, 'pay.confirm', { taskId, amount: amountArg, account, reward: payout.reward }),
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback(t(L, 'btn.payConfirm'), `pay:confirm:${token}`),
+          Markup.button.callback(t(L, 'btn.cancel'), `pay:cancel:${token}`),
+        ],
+      ]),
+    );
+  });
+
+  bot.action(/^pay:confirm:([0-9a-f-]{36})$/, async (ctx) => {
+    if (!(await requirePrivateCb(ctx))) return;
+    const L = localeOf(ctx);
+    if (!isAdmin(ctx.from?.id)) return safeAnswerCb(ctx, t(L, 'common.adminsOnly'), { show_alert: true });
+    const pending = takePayConfirmation(ctx.match[1], ctx.from?.id);
+    if (!pending) return safeAnswerCb(ctx, t(L, 'pay.confirmExpired'), { show_alert: true });
     try {
-      // An invalid/over-long account never echoes: proposePayout format-checks it
-      // (assertPayableAccount) before any message interpolates it.
-      const res = await proposePayout(payout.id, account, yocto);
+      const res = await proposePayout(pending.payoutId, pending.account, pending.yocto);
       if ('proposalId' in res) {
         // Echo the advertised (free-text) reward next to the proposed amount:
         // the admin resolves "50 USDC" to NEAR by hand, and the approver's
         // verify-before-vote is the only control after this line.
-        await ctx.reply(
+        await safeAnswerCb(ctx);
+        await ctx.editMessageText(
           t(L, 'pay.proposed', {
-            taskId,
-            amount: amountArg,
-            account,
-            reward: payout.reward,
+            taskId: pending.taskId,
+            amount: pending.amount,
+            account: pending.account,
+            reward: pending.reward,
             proposalId: res.proposalId,
             url: proposalUrl(res.proposalId),
           }),
@@ -1420,11 +1480,27 @@ export function createBot(): Telegraf<BotContext> {
       } else {
         // Submitted, but the gateway's proposal id didn't verify — don't print an
         // id we can't trust; reconcile adopts the real one by description.
-        await ctx.reply(t(L, 'pay.submitted', { taskId, amount: amountArg, account, reward: payout.reward }));
+        await safeAnswerCb(ctx);
+        await ctx.editMessageText(
+          t(L, 'pay.submitted', {
+            taskId: pending.taskId,
+            amount: pending.amount,
+            account: pending.account,
+            reward: pending.reward,
+          }),
+        );
       }
     } catch (err) {
-      await ctx.reply(errorMessage(err, t(L, 'pay.fail')));
+      await answerCbError(ctx, L, err);
     }
+  });
+
+  bot.action(/^pay:cancel:([0-9a-f-]{36})$/, async (ctx) => {
+    if (!(await requirePrivateCb(ctx))) return;
+    const L = localeOf(ctx);
+    pendingPayConfirmations.delete(ctx.match[1]);
+    await safeAnswerCb(ctx, t(L, 'common.cancelled'));
+    await ctx.editMessageText(t(L, 'pay.cancelled')).catch(() => undefined);
   });
 
   // Contributor sets/views their standing DAO-push payout account (gated on

@@ -61,6 +61,7 @@ export const en = {
   'btn.revRejectConfirm': 'Yes, reject permanently',
   'btn.revRevise': '🔁 Revise',
   'btn.cancel': 'Cancel',
+  'btn.payConfirm': 'Confirm DAO proposal',
   'btn.full': '📄 Full submission',
   'btn.reviewNext': 'Next page ▶',
   'btn.home.open': '📋 Browse tasks',
@@ -576,8 +577,17 @@ export const en = {
     'Usage: <code>/pay &lt;taskId&gt; &lt;amountNEAR&gt; [recipient.near]</code>\n' +
     'Omit the recipient to use the contributor’s saved account. Example: <code>/pay 7 0.5</code>',
   'pay.badAmount': 'Amount must be a positive NEAR number, e.g. 0.5',
+  'pay.badRecipient': 'That is not a valid NEAR account id.',
   'pay.noRecipient': (p: { taskId: number; amount: string }) =>
     `No recipient — the contributor hasn't saved a payout account. Pass one: <code>/pay ${p.taskId} ${esc(p.amount)} &lt;recipient.near&gt;</code>`,
+  'pay.confirm': (p: { taskId: number; amount: string; account: string; reward: string }) =>
+    `Confirm DAO payout proposal for task #<code>${p.taskId}</code>:\n` +
+    `Amount: <b>${esc(p.amount)} NEAR</b>\n` +
+    `Recipient: <code>${esc(p.account)}</code>\n` +
+    `Advertised reward: 🎁 ${esc(p.reward)}\n\n` +
+    `This creates a public DAO Transfer proposal. Verify the recipient and conversion before continuing.`,
+  'pay.confirmExpired': 'This payout confirmation expired. Re-run /pay to confirm the latest queue state.',
+  'pay.cancelled': 'Cancelled — no DAO proposal was submitted.',
   'pay.proposed': (p: { taskId: number; amount: string; account: string; reward: string; proposalId: number; url: string | null }) =>
     `✅ Proposed payout for task #<code>${p.taskId}</code>: ${esc(p.amount)} NEAR → <code>${esc(p.account)}</code>\n` +
     `Advertised reward was 🎁 ${esc(p.reward)} — eyeball the conversion.\n` +
