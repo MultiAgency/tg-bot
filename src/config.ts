@@ -33,6 +33,7 @@ function positiveNumber(name: string, fallback: number): number {
 }
 
 const adminIdsRaw = process.env.ADMIN_IDS ?? process.env.ADMIN_TELEGRAM_IDS ?? '';
+const adminIdsSource = process.env.ADMIN_IDS ? 'ADMIN_IDS' : process.env.ADMIN_TELEGRAM_IDS ? 'ADMIN_TELEGRAM_IDS' : 'none';
 if (!process.env.ADMIN_IDS && process.env.ADMIN_TELEGRAM_IDS) {
   console.warn('[config] ADMIN_TELEGRAM_IDS is accepted as a legacy alias; prefer ADMIN_IDS.');
 }
@@ -51,6 +52,7 @@ const adminIds = new Set(
 export const config = {
   botToken: required('BOT_TOKEN'),
   adminIds,
+  adminIdsSource,
   // PostgreSQL connection string (Railway injects DATABASE_URL). Local dev/CI use
   // the docker-compose Postgres; see README.
   databaseUrl: required('DATABASE_URL'),

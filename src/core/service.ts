@@ -337,7 +337,7 @@ export function assignApplication(applicationId: number, adminId: number): Promi
     }
     const updated = await applications.setStatus(app.id, ApplicationStatus.Assigned);
     await contributors.incrementAssigned(app.contributor_id);
-    await addHistory(task.id, 'assigned', adminId, contributorDetail(app.contributor_id), app.contributor_id);
+    await addHistory(task.id, 'assigned', adminId, contributorDetail(app.contributor_id, `application #${app.id}`), app.contributor_id);
     return { application: updated, task, filled: taken + 1 >= task.max_assignees };
   });
 }
@@ -350,7 +350,7 @@ export function declineApplication(applicationId: number, adminId: number): Prom
       throw new WorkflowError(`Application #${applicationId} is "${app.status}" and cannot be declined.`);
     }
     const updated = await applications.setStatus(app.id, ApplicationStatus.Declined);
-    await addHistory(app.task_id, 'declined', adminId, contributorDetail(app.contributor_id), app.contributor_id);
+    await addHistory(app.task_id, 'declined', adminId, contributorDetail(app.contributor_id, `application #${app.id}`), app.contributor_id);
     return { application: updated, task: await tasks.getTask(app.task_id) };
   });
 }

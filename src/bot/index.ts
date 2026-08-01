@@ -979,7 +979,7 @@ export function createBot(): Telegraf<BotContext> {
     } catch {
       lines.push(t(L, 'diag.db', { ok: false }));
     }
-    lines.push(t(L, 'diag.admins', { n: config.adminIds.size }));
+    lines.push(t(L, 'diag.admins', { n: config.adminIds.size, source: config.adminIdsSource }));
     if (!config.announceChatId) lines.push(t(L, 'diag.announceMissing'));
     else {
       try {
@@ -1014,7 +1014,19 @@ export function createBot(): Telegraf<BotContext> {
         : t(L, 'diag.outlayerOff', { daoOn: Boolean(config.daoContractId) }),
     );
     lines.push(config.webPort ? t(L, 'diag.webOn', { url: config.webAppUrl }) : t(L, 'diag.webOff'));
-    lines.push(ai.aiEnabled() ? t(L, 'diag.aiOn') : t(L, 'diag.aiOff'));
+    lines.push(
+      ai.aiEnabled()
+        ? t(L, 'diag.aiOn', {
+            model: config.aiModel,
+            agentModel: config.agentModel,
+            promptVersion: ai.AI_ASSIST_PROMPT_VERSION,
+            signalCap: config.signalMaxPerHour,
+            signalGlobalCap: config.signalGlobalMaxPerHour,
+            agentCap: config.agentMaxPerHour,
+            agentGlobalCap: config.agentGlobalMaxPerHour,
+          })
+        : t(L, 'diag.aiOff'),
+    );
     await ctx.reply(clampMessage(lines.join('\n')));
   });
 

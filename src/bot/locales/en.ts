@@ -335,8 +335,10 @@ export const en = {
   // ---- /diag (admin): config preflight — is this instance actually wired? ----
   'diag.title': '🩺 Diagnostics',
   'diag.db': (p: { ok: boolean }) => (p.ok ? '✅ Database reachable' : '❌ Database unreachable'),
-  'diag.admins': (p: { n: number }) =>
-    p.n > 0 ? `✅ Global admins: ${p.n}` : '⚠️ ADMIN_IDS is empty — nobody can create, approve, or review',
+  'diag.admins': (p: { n: number; source: string }) =>
+    p.n > 0
+      ? `✅ Global admins: ${p.n} (${esc(p.source)})`
+      : '⚠️ ADMIN_IDS is empty — nobody can create, approve, or review',
   'diag.announceOk': (p: { title: string }) => `✅ Announce chat reachable${p.title ? ` (${esc(p.title)})` : ''}`,
   'diag.announceMissing':
     '⚠️ No ANNOUNCE_CHAT_ID — new global tasks are announced nowhere; contributors must poll /open (opt-in DMs still go out)',
@@ -357,7 +359,16 @@ export const en = {
   'diag.webOn': (p: { url: string }) =>
     `✅ Web tier on${p.url ? ` — ${esc(p.url)}` : ' (no WEB_APP_URL: Mini App menu buttons stay off)'}`,
   'diag.webOff': 'ℹ️ Web tier off (no PORT/WEB_PORT) — bot-only deployment, /healthz unavailable',
-  'diag.aiOn': '✅ AI enabled',
+  'diag.aiOn': (p: {
+    model: string;
+    agentModel: string;
+    promptVersion: string;
+    signalCap: number;
+    signalGlobalCap: number;
+    agentCap: number;
+    agentGlobalCap: number;
+  }) =>
+    `✅ AI enabled — assist <code>${esc(p.model)}</code>, agent <code>${esc(p.agentModel)}</code>, prompt <code>${esc(p.promptVersion)}</code>, caps signals ${p.signalCap}/room/h ${p.signalGlobalCap}/global/h; agent ${p.agentCap}/room/h ${p.agentGlobalCap}/global/h`,
   'diag.aiOff': 'ℹ️ AI off (no NEAR_AI_API_KEY) — drafting, summaries, signals, and agent mode disabled',
 
   // ---- action outcomes ----
