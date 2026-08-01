@@ -134,6 +134,21 @@ export interface SignalEvaluation {
   maxAssignees: number | null;
 }
 
+interface RequirementCheck {
+  requirement: string;
+  status: 'met' | 'unclear' | 'missing';
+  evidence: string | null;
+}
+
+interface ReviewAssessment {
+  summary: string;
+  requirementChecks: RequirementCheck[];
+  missingItems: string[];
+  risks: string[];
+  questions: string[];
+  confidence: number;
+}
+
 /**
  * Extract the first complete brace-balanced JSON object from a model reply,
  * ignoring braces inside strings. Scanning to the matching close (rather than
@@ -191,6 +206,82 @@ function parseSignalEvaluation(raw: string): SignalEvaluation | null {
   };
 }
 
+function parseJsonObject(raw: string): Record<string, unknown> | null {
+  const json = firstJsonObject(raw);
+  if (json === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : null;
+}
+
+function text(v: unknown): string | null {
+  return typeof v === 'string' && v.trim() ? v.trim() : null;
+}
+
+function textList(v: unknown, limit = 5): string[] {
+  if (!Array.isArray(v)) return [];
+  return v.map(text).filter((item): item is string => item !== null).slice(0, limit);
+}
+
+function parseReviewAssessment(raw: string): ReviewAssessment | null {
+  const p = parseJsonObject(raw);
+  if (p === null) return null;
+  const summary = text(p.summary);
+  if (summary === null) return null;
+
+  const checks = Array.isArray(p.requirementChecks)
+    ? p.requirementChecks
+        .map((item): RequirementCheck | null => {
+          if (typeof item !== 'object' || item === null) return null;
+          const row = item as Record<string, unknown>;
+          const requirement = text(row.requirement);
+          const status = row.status;
+          if (requirement === null || (status !== 'met' && status !== 'unclear' && status !== 'missing')) return null;
+          return { requirement, status, evidence: text(row.evidence) };
+        })
+        .filter((item): item is RequirementCheck => item !== null)
+        .slice(0, 6)
+    : [];
+
+  const confidence =
+    typeof p.confidence === 'number' && Number.isFinite(p.confidence)
+      ? Math.min(1, Math.max(0, p.confidence))
+      : 0.5;
+  return {
+    summary,
+    requirementChecks: checks,
+    missingItems: textList(p.missingItems),
+    risks: textList(p.risks),
+    questions: textList(p.questions, 3),
+    confidence,
+  };
+}
+
+function renderReviewAssessment(a: ReviewAssessment): string {
+  const lines = [
+    `Summary: ${a.summary}`,
+  ];
+  if (a.requirementChecks.length) {
+    lines.push(
+      '',
+      'Requirement check:',
+      ...a.requirementChecks.map((c) => {
+        const evidence = c.evidence ? ` — ${c.evidence}` : '';
+        return `- ${c.status}: ${c.requirement}${evidence}`;
+      }),
+    );
+  }
+  if (a.missingItems.length) lines.push('', `Possibly missing: ${a.missingItems.join('; ')}`);
+  if (a.risks.length) lines.push('', `Risks: ${a.risks.join('; ')}`);
+  if (a.questions.length) lines.push('', 'Reviewer questions:', ...a.questions.map((q) => `- ${q}`));
+  lines.push('', `Confidence: ${Math.round(a.confidence * 100)}%`);
+  return lines.join('\n');
+}
+
 /**
  * Score one group-chat message as a potential task (signal detection). Returns
  * null when AI is off, the call fails, or the reply doesn't validate. Advisory
@@ -235,22 +326,27 @@ export async function evaluateSignal(
 }
 
 /**
- * One advisory note per submission for the reviewer: a short summary plus any
- * required-output items that appear to be missing. Deliberately observations,
+ * One advisory note per submission for the reviewer: a structured rubric pass
+ * over the required output plus risks and questions. Deliberately observations,
  * never a completeness verdict — a "looks complete" judgment would anchor the
  * human decision it is meant to inform.
  */
-export function reviewNote(task: Task, submission: string, signal?: AbortSignal): Promise<string | null> {
-  return complete(
+export async function reviewNote(task: Task, submission: string, signal?: AbortSignal): Promise<string | null> {
+  const raw = await complete(
     'review-note',
-    'You help a busy reviewer assess a contributor submission. Return two parts: ' +
-      '(1) 1–3 sentences summarizing what was submitted and anything notable; ' +
-      '(2) if any part of the required output appears to be missing, one sentence starting ' +
-      '"Possibly missing:" naming it — omit this part when nothing seems missing. ' +
-      'Point at facts only; give no overall completeness verdict. The human decides. No preamble.',
+    'You help a busy reviewer assess a contributor submission. Point at facts only; never give an overall ' +
+      'approve/reject verdict and never claim work is complete. Compare the submission against each required-output ' +
+      'item when the task provides one. Respond with ONLY valid JSON, no prose, no markdown fences, exactly: ' +
+      '{"summary": string, "requirementChecks": [{"requirement": string, "status": "met"|"unclear"|"missing", ' +
+      '"evidence": string|null}], "missingItems": string[], "risks": string[], "questions": string[], ' +
+      '"confidence": number}. Confidence is 0-1 and means confidence in this assessment, not quality of the work. ' +
+      'Use "unclear" when the submission does not give enough evidence. Keep every string concise.',
     `Task: ${task.title}\nRequired output: ${task.required_output ?? '(unspecified)'}\n\n` +
       `Submission:\n${submission}`,
-    700,
+    900,
     signal,
   );
+  if (raw === null) return null;
+  const assessment = parseReviewAssessment(raw);
+  return assessment ? renderReviewAssessment(assessment) : raw;
 }
