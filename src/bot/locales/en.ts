@@ -58,7 +58,9 @@ export const en = {
   'btn.withdraw': '↩️ Withdraw',
   'btn.revApprove': '✅ Approve',
   'btn.revReject': '❌ Reject',
+  'btn.revRejectConfirm': 'Yes, reject permanently',
   'btn.revRevise': '🔁 Revise',
+  'btn.cancel': 'Cancel',
   'btn.full': '📄 Full submission',
   'btn.reviewNext': 'Next page ▶',
   'btn.home.open': '📋 Browse tasks',
@@ -365,6 +367,8 @@ export const en = {
   'reviewAction.approved': (p: { id: number }) =>
     `✅ Approved submission #${p.id}. The contributor will be notified.`,
   'reviewAction.popup': 'Approved',
+  'reviewAction.rejectConfirm': (p: { id: number }) =>
+    `Rejecting submission #${p.id} is final for this assignment. The contributor cannot revise or re-apply to this task after a reject. Use Revise instead if you want another version.`,
 
   // ---- newtask wizard ----
   'nt.aiHint': ' (or send /ai to let AI draft this)',

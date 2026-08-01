@@ -1647,8 +1647,29 @@ export function createBot(): Telegraf<BotContext> {
       );
     }
     if (!(await gate(ctx))) return;
+    if (decision === 'reject') {
+      const L = localeOf(ctx);
+      await safeAnswerCb(ctx);
+      return ctx.reply(
+        t(L, 'reviewAction.rejectConfirm', { id: submissionId }),
+        Markup.inlineKeyboard([
+          [
+            Markup.button.callback(t(L, 'btn.revRejectConfirm'), `rev:reject-confirm:${submissionId}`),
+            Markup.button.callback(t(L, 'btn.cancel'), 'pg:noop'),
+          ],
+        ]),
+      );
+    }
     await safeAnswerCb(ctx);
     await ctx.scene.enter(SCENES.review, { submissionId, decision });
+  });
+
+  bot.action(/^rev:reject-confirm:(\d+)$/, async (ctx) => {
+    const submissionId = Number(ctx.match[1]);
+    const gate = requireManageCb(() => taskOfSubmission(submissionId));
+    if (!(await gate(ctx))) return;
+    await safeAnswerCb(ctx);
+    await ctx.scene.enter(SCENES.review, { submissionId, decision: 'reject' });
   });
 
   // ---- Rooms (group chats) & signal detection ----
