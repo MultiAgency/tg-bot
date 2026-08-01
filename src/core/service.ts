@@ -498,7 +498,12 @@ export function reviewSubmission(
       throw new WorkflowError(`Submission #${submissionId} is "${sub.status}" and cannot be reviewed.`);
     }
     const reviewed = await submissions.setReview(sub.id, DECISION_STATUS[decision], note);
-    await addHistory(app.task_id, `review_${decision}`, reviewerId, note, app.contributor_id);
+    const reviewDetail = [
+      `submission #${sub.id}`,
+      `v${sub.version}`,
+      note ? `note: ${note}` : null,
+    ].filter(Boolean).join(' · ');
+    await addHistory(app.task_id, `review_${decision}`, reviewerId, reviewDetail, app.contributor_id);
     // Loaded once here for both the payout check below and the returned result.
     const task = await tasks.getTask(app.task_id);
     if (decision === 'approve') {
@@ -528,6 +533,23 @@ export function reviewSubmission(
     }
     return { submission: reviewed, application: app, task };
   });
+}
+
+export function recordAiReviewNote(
+  taskId: number,
+  submissionId: number,
+  model: string,
+  promptVersion: string,
+  confidence: number | null,
+  parsed: boolean,
+): Promise<void> {
+  const confidenceText = confidence === null ? 'n/a' : `${Math.round(confidence * 100)}%`;
+  return addHistory(
+    taskId,
+    'ai_review_note',
+    null,
+    `submission #${submissionId} · model ${model} · prompt ${promptVersion} · confidence ${confidenceText} · ${parsed ? 'parsed' : 'raw fallback'}`,
+  );
 }
 
 // ---- Rooms & room admins ----
@@ -1717,6 +1739,13 @@ export async function proposePayout(
       if (fresh.proposal_id != null) return fresh.proposal_id;
       assertNoConflictingClaim(fresh, receiverAccount, amountYocto);
       await payouts.markProposed(payoutId, adoptable.id, receiverAccount, amountYocto);
+      await addHistory(
+        fresh.task_id,
+        'payout_proposed',
+        null,
+        `payout #${payoutId} adopted DAO proposal #${adoptable.id} · ${receiverAccount} · ${amountYocto} yoctoNEAR`,
+        fresh.contributor_id,
+      );
       return adoptable.id;
     });
     if (res === 'settled') throw new WorkflowError(`Payout #${payoutId} is already settled — nothing to propose.`);
@@ -1809,7 +1838,16 @@ export async function proposePayout(
     await lockedPayoutApply(
       payoutId,
       (fresh) => fresh.status === 'proposed' && fresh.proposal_id == null,
-      () => payouts.markProposed(payoutId, proposalId, receiverAccount, amountYocto),
+      async (fresh) => {
+        await payouts.markProposed(payoutId, proposalId, receiverAccount, amountYocto);
+        await addHistory(
+          fresh.task_id,
+          'payout_proposed',
+          null,
+          `payout #${payoutId} DAO proposal #${proposalId} · ${receiverAccount} · ${amountYocto} yoctoNEAR`,
+          fresh.contributor_id,
+        );
+      },
     );
     return { proposalId };
   }
@@ -1818,6 +1856,13 @@ export async function proposePayout(
   // carries our description and will be adopted by reconcile. Report "submitted,
   // confirm via /payouts" rather than printing an id we've proven we can't trust.
   console.warn(`[dao] OutLayer proposal id for payout ${payoutId} didn't verify — leaving it for reconcile to adopt by description`);
+  await addHistory(
+    target.task_id,
+    'payout_submitted',
+    null,
+    `payout #${payoutId} submitted via OutLayer; proposal id pending verification · ${receiverAccount} · ${amountYocto} yoctoNEAR`,
+    target.contributor_id,
+  );
   return { submitted: true };
 }
 

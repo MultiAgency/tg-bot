@@ -12,6 +12,7 @@ import {
   getApplication,
   getTask,
   latestSubmission,
+  recordAiReviewNote,
   submitWork,
   errorMessage,
 } from '../../core/service.js';
@@ -150,8 +151,18 @@ export const submitScene = new Scenes.WizardScene<BotContext>(
       // drains the note's enqueue transaction before the pool closes.
       const submission = sub;
       runDetached('submit-ai-note', async (signal) => {
-        const note = await ai.reviewNote(task, aiText, signal);
-        if (note) await notifyReviewerNote(submission, app, task, note);
+        const note = await ai.reviewNoteWithMetadata(task, aiText, signal);
+        if (note) {
+          await notifyReviewerNote(submission, app, task, note.text);
+          await recordAiReviewNote(
+            task.id,
+            submission.id,
+            note.metadata.model,
+            note.metadata.promptVersion,
+            note.metadata.confidence,
+            note.metadata.parsed,
+          );
+        }
       });
     }
     return ctx.scene.leave();

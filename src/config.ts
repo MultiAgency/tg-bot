@@ -32,8 +32,13 @@ function positiveNumber(name: string, fallback: number): number {
   return n;
 }
 
+const adminIdsRaw = process.env.ADMIN_IDS ?? process.env.ADMIN_TELEGRAM_IDS ?? '';
+if (!process.env.ADMIN_IDS && process.env.ADMIN_TELEGRAM_IDS) {
+  console.warn('[config] ADMIN_TELEGRAM_IDS is accepted as a legacy alias; prefer ADMIN_IDS.');
+}
+
 const adminIds = new Set(
-  (process.env.ADMIN_IDS ?? '')
+  adminIdsRaw
     .split(',')
     .map((id) => id.trim())
     .filter(Boolean)

@@ -99,7 +99,7 @@ local secrets you never want in the shared file. Remember it exists: a stale
 | Variable           | Required | Purpose                                                                                                                         |
 | ------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | `BOT_TOKEN`        | ✅       | Bot token from [@BotFather](https://t.me/BotFather)                                                                             |
-| `ADMIN_IDS`        | ⚠️       | Comma-separated Telegram numeric IDs allowed to create/approve/review. The bot boots without it (logs a warning), but no one can create, approve, or review until it's set. Get yours from [@userinfobot](https://t.me/userinfobot). |
+| `ADMIN_IDS`        | ⚠️       | Comma-separated Telegram numeric IDs allowed to create/approve/review. The bot boots without it (logs a warning), but no one can create, approve, or review until it's set. Get yours from [@userinfobot](https://t.me/userinfobot). `ADMIN_TELEGRAM_IDS` is accepted as a legacy alias, but `ADMIN_IDS` is preferred. |
 | `DATABASE_URL`     | ✅       | PostgreSQL connection string (Railway injects it from its Postgres plugin; local dev uses the docker-compose Postgres)          |
 | `ANNOUNCE_CHAT_ID` | –      | Chat where newly opened tasks are announced — the primary discovery surface. Any chat: a private/public group or a channel (numeric id or `@username`); the bot must be a member (admin to post in a channel). Empty disables (approval unaffected). |
 | `BOT_USERNAME`     | –        | Bot @username (no `@`). When set, the announcement post carries a deep-link **Apply** button (`t.me/<username>?start=t<taskId>`); otherwise it points at `/open`. |
@@ -333,6 +333,16 @@ When `NEAR_AI_API_KEY` is set:
   (see "Signal detection" above)
 - Converse in groups with AI mode on — proposing drafts and applications as
   confirmation cards a human still taps (see "AI mode" above)
+
+The AI calls are API calls, not an in-process reasoning engine. Task drafting,
+required-output suggestions, submission review notes, and signal scoring are
+stateless per call except for the explicit input passed to that request. Signal
+detection gets a small RAM-only recent-message context window; group AI mode gets
+bounded RAM-only conversation memory so it can handle short follow-ups. Neither
+memory store is persisted, and both are lost on restart without losing workflow
+state. Review-note prompts are versioned in code and their advisory metadata
+(model, prompt version, parse status, confidence) is written to task history
+without storing the raw submission text twice.
 
 AI never approves contributors or submissions, and never opens a task.
 

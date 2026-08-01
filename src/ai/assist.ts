@@ -11,6 +11,16 @@ import type { Task } from '../core/models/task.js';
 
 export { aiEnabled } from './client.js';
 
+export const AI_ASSIST_PROMPT_VERSION = '2026-08-01.ai-assist-v2';
+
+export interface AiAssessmentMetadata {
+  provider: 'near-ai-openai-compatible';
+  model: string;
+  promptVersion: string;
+  parsed: boolean;
+  confidence: number | null;
+}
+
 async function complete(
   kind: string,
   system: string,
@@ -236,7 +246,7 @@ function textList(v: unknown, limit = 5): string[] {
   return v.map(text).filter((item): item is string => item !== null).slice(0, limit);
 }
 
-function parseReviewAssessment(raw: string): ReviewAssessment | null {
+export function parseReviewAssessment(raw: string): ReviewAssessment | null {
   const p = parseJsonObject(raw);
   if (p === null) return null;
   const summary = text(p.summary);
@@ -344,6 +354,19 @@ export async function evaluateSignal(
  * human decision it is meant to inform.
  */
 export async function reviewNote(task: Task, submission: string, signal?: AbortSignal): Promise<string | null> {
+  return (await reviewNoteWithMetadata(task, submission, signal))?.text ?? null;
+}
+
+export interface AiReviewNote {
+  text: string;
+  metadata: AiAssessmentMetadata;
+}
+
+export async function reviewNoteWithMetadata(
+  task: Task,
+  submission: string,
+  signal?: AbortSignal,
+): Promise<AiReviewNote | null> {
   const raw = await complete(
     'review-note',
     'You help a busy reviewer assess a contributor submission. Point at facts only; never give an overall ' +
@@ -360,5 +383,15 @@ export async function reviewNote(task: Task, submission: string, signal?: AbortS
   );
   if (raw === null) return null;
   const assessment = parseReviewAssessment(raw);
-  return assessment ? renderReviewAssessment(assessment) : raw;
+  const metadata: AiAssessmentMetadata = {
+    provider: 'near-ai-openai-compatible',
+    model: config.aiModel,
+    promptVersion: AI_ASSIST_PROMPT_VERSION,
+    parsed: assessment !== null,
+    confidence: assessment?.confidence ?? null,
+  };
+  return {
+    text: assessment ? renderReviewAssessment(assessment) : raw,
+    metadata,
+  };
 }
