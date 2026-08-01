@@ -32,9 +32,11 @@ function positiveNumber(name: string, fallback: number): number {
   return n;
 }
 
-const adminIdsRaw = process.env.ADMIN_IDS ?? process.env.ADMIN_TELEGRAM_IDS ?? '';
-const adminIdsSource = process.env.ADMIN_IDS ? 'ADMIN_IDS' : process.env.ADMIN_TELEGRAM_IDS ? 'ADMIN_TELEGRAM_IDS' : 'none';
-if (!process.env.ADMIN_IDS && process.env.ADMIN_TELEGRAM_IDS) {
+const adminIdsEnv = process.env.ADMIN_IDS?.trim();
+const legacyAdminIdsEnv = process.env.ADMIN_TELEGRAM_IDS?.trim();
+const adminIdsRaw = adminIdsEnv || legacyAdminIdsEnv || '';
+const adminIdsSource = adminIdsEnv ? 'ADMIN_IDS' : legacyAdminIdsEnv ? 'ADMIN_TELEGRAM_IDS' : 'none';
+if (!adminIdsEnv && legacyAdminIdsEnv) {
   console.warn('[config] ADMIN_TELEGRAM_IDS is accepted as a legacy alias; prefer ADMIN_IDS.');
 }
 

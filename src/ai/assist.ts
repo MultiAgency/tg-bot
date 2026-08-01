@@ -196,7 +196,7 @@ function firstJsonObject(raw: string): string | null {
  * fences, prose around the object) and returning null for anything that doesn't
  * validate — a bad response means "not a signal", never a crash or a bad task.
  */
-function parseSignalEvaluation(raw: string): SignalEvaluation | null {
+export function parseSignalEvaluation(raw: string): SignalEvaluation | null {
   const json = firstJsonObject(raw);
   if (json === null) return null;
   let parsed: unknown;

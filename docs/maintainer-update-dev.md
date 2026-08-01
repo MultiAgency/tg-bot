@@ -11,6 +11,7 @@
 - Admin env compatibility: `ADMIN_TELEGRAM_IDS` is accepted as a legacy alias, while `ADMIN_IDS` remains preferred.
 - Diagnostics: `/diag` reports admin env source, AI models, prompt version, and per-room/global AI caps.
 - Parser test: `npm run ai-parser-check` validates AI review JSON parsing without calling the model.
+- Config test: `npm run config-check` validates admin env precedence without real secrets.
 
 ## Good Parts
 
@@ -35,3 +36,12 @@
 - Set `DAO_CONTRACT_ID` and `OUTLAYER_API_KEY` only when DAO payout proposing should be live.
 - Deploy `dev`, then run `/diag`.
 - Smoke test: create task, approve, apply, assign, submit, review approve/revise/reject, then test `/payouts` and `/pay` if DAO is configured.
+
+## Offline Checks Before Env Exists
+
+- `npm run typecheck`
+- `npm run web:typecheck`
+- `npm run build`
+- `npm run dao-check`
+- `npm run ai-parser-check`
+- `npm run config-check`
