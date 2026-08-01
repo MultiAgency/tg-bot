@@ -91,5 +91,9 @@ async function evaluate(
     evaluation.score,
   );
   console.log(`[signals] drafted task #${task.id} from a signal in room ${chatId} (score ${evaluation.score})`);
-  await notifySignalDraft(task, roomTitle);
+  await notifySignalDraft(task, roomTitle, {
+    score: evaluation.score,
+    confidence: evaluation.confidence,
+    reason: evaluation.reason,
+  });
 }

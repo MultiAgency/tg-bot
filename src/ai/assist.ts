@@ -132,6 +132,10 @@ export interface SignalEvaluation {
   deadline: string | null;
   /** Clamped to 1–20; null falls back to the createTask default of 1. */
   maxAssignees: number | null;
+  /** Short explanation for the admin; must not quote group text verbatim. */
+  reason: string | null;
+  /** 0–1 confidence in this signal assessment. */
+  confidence: number | null;
 }
 
 interface RequirementCheck {
@@ -203,6 +207,11 @@ function parseSignalEvaluation(raw: string): SignalEvaluation | null {
     requiredOutput: text(p.requiredOutput),
     deadline: text(p.deadline),
     maxAssignees: clampSlots(p.maxAssignees),
+    reason: text(p.reason),
+    confidence:
+      typeof p.confidence === 'number' && Number.isFinite(p.confidence)
+        ? Math.min(1, Math.max(0, p.confidence))
+        : null,
   };
 }
 
@@ -316,7 +325,10 @@ export async function evaluateSignal(
       `${DRAFT_CONTRACT}\n\n` +
       'Respond with ONLY valid JSON, no prose, no markdown fences, exactly: ' +
       '{"score": number, "shouldDraft": boolean, "title": string|null, "description": string|null, ' +
-      '"requiredOutput": string|null, "deadline": string|null, "maxAssignees": number|null}. ' +
+      '"requiredOutput": string|null, "deadline": string|null, "maxAssignees": number|null, ' +
+      '"reason": string|null, "confidence": number|null}. ' +
+      'Reason is a one-sentence admin-facing explanation of why this should become a task; summarize, never quote ' +
+      'the group message verbatim. Confidence is 0-1 for this assessment. ' +
       'Be conservative — when in doubt, shouldDraft is false and the draft fields are null.',
     `${contextBlock}Message to assess:\n${message}`,
     700,

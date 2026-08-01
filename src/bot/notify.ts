@@ -436,7 +436,11 @@ export async function enqueueAnnounceRows(rows: NewNotification[]): Promise<void
  * Alert a task's managers that signal detection auto-drafted it. Task-only
  * content (the AI-distilled draft names no contributor) — subjectId null.
  */
-export async function notifySignalDraft(task: Task, roomTitle: string | null): Promise<void> {
+export async function notifySignalDraft(
+  task: Task,
+  roomTitle: string | null,
+  signal: { score: number; confidence: number | null; reason: string | null },
+): Promise<void> {
   // The alert IS the approve card: full draft detail + the same approve:<id>
   // button /approve renders (auth re-checked on tap), so acting on a draft is
   // one tap from the DM — not "run /approve, then tap" (the double-approve the
@@ -445,7 +449,7 @@ export async function notifySignalDraft(task: Task, roomTitle: string | null): P
   await enqueueForManagers(task, null, (managerId, L) => [
     {
       dedupKey: `signal-draft:${task.id}:${managerId}`,
-      text: clampMessage(t(L, 'notify.signalDraft', { detail, room: roomTitle })),
+      text: clampMessage(t(L, 'notify.signalDraft', { detail, room: roomTitle, ...signal })),
       replyMarkup: markup(draftButtons(task, L)),
     },
   ]);

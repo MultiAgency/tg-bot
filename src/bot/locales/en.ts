@@ -625,8 +625,11 @@ export const en = {
   'app.notManageable': (p: { id: number }) => `Application #${p.id} not found (or not yours to manage).`,
 
   // ---- notifications ----
-  'notify.signalDraft': (p: { detail: string; room: string | null }) =>
-    `🔎 Signal detection drafted a task from${p.room ? ` "${esc(p.room)}"` : ' a group'}:\n\n${p.detail}\n\nTap to approve &amp; open it — or leave it as a draft (/approve lists everything waiting).`,
+  'notify.signalDraft': (p: { detail: string; room: string | null; score: number; confidence: number | null; reason: string | null }) =>
+    `🔎 Signal detection drafted a task from${p.room ? ` "${esc(p.room)}"` : ' a group'}:\n\n${p.detail}\n\n` +
+    `AI signal: score ${p.score}/10${p.confidence !== null ? ` · confidence ${Math.round(p.confidence * 100)}%` : ''}${
+      p.reason ? `\nReason: ${esc(p.reason)}` : ''
+    }\n\nTap to approve &amp; open it — or leave it as a draft (/approve lists everything waiting).`,
   'notify.roomRegistered': (p: { title: string | null; chatId: number; inviterId: number | null }) =>
     `👥 The bot was added to the group ${p.title ? `"${esc(p.title)}"` : String(p.chatId)}${
       p.inviterId !== null ? ` by user ${p.inviterId}, who is now that room’s first admin` : ''

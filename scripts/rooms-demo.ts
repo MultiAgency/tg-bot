@@ -148,6 +148,8 @@ async function main(): Promise<void> {
       // Out of range on purpose: exercises the 1–20 slot clamp in
       // parseSignalEvaluation — it must land as 20, never the raw 99.
       maxAssignees: 99,
+      reason: 'The group asked for a concrete translation task before a named event.',
+      confidence: 0.82,
     });
   mark = outbound.length;
   await inGroup(OMAR, 'we really need someone to translate the onboarding docs to Spanish before the meetup next week');
@@ -174,8 +176,15 @@ async function main(): Promise<void> {
   await drainNotifications(bot.telegram);
   for (const managerId of [ADMIN, MAYA]) {
     assert.ok(
-      repliesTo(mark, managerId).some((o) => o.text.includes('Signal detection drafted') && o.text.includes('Builders Guild')),
-      `manager ${managerId} was told about the draft`,
+      repliesTo(mark, managerId).some(
+        (o) =>
+          o.text.includes('Signal detection drafted') &&
+          o.text.includes('Builders Guild') &&
+          o.text.includes('score 8/10') &&
+          o.text.includes('confidence 82%') &&
+          o.text.includes('concrete translation task'),
+      ),
+      `manager ${managerId} was told about the draft with signal rationale`,
     );
   }
   ok('draft created, room-linked, authorless; both managers notified');

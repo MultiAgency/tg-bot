@@ -88,6 +88,8 @@ function render(c: Case): Promise<boolean> {
       console.log(`   title:        ${ev.title ?? '(none)'}`);
       console.log(`   deadline:     ${ev.deadline ?? '(none)'}`);
       console.log(`   maxAssignees: ${ev.maxAssignees ?? '(default 1)'}`);
+      console.log(`   confidence:   ${ev.confidence !== null ? `${Math.round(ev.confidence * 100)}%` : '(none)'}`);
+      console.log(`   reason:       ${ev.reason ?? '(none)'}`);
       console.log(`   description:  ${ev.description ?? '(none)'}`);
       console.log(`   requiredOutput:\n${(ev.requiredOutput ?? '(none)').replace(/^/gm, '     ')}`);
     }
