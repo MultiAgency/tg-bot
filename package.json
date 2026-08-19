@@ -31,7 +31,7 @@
     "ai-agent-smoke": "DATABASE_URL=${TEST_DATABASE_URL:-postgresql://multiagency:multiagency@localhost:5455/multiagency_test} BOT_TOKEN=000000:demo ADMIN_IDS=1 tsx scripts/ai-agent-smoke.ts"
   },
   "dependencies": {
-    "@hono/node-server": "^2.0.8",
+    "@hono/node-server": "^2.0.10",
     "@orpc/client": "^1.14.8",
     "@orpc/server": "^1.14.8",
     "dotenv": "^17.4.2",
